@@ -1,0 +1,15 @@
+{
+  "name": "molecule-desci-marketplace",
+  "owner": {
+    "name": "Vladimir Demidov",
+    "email": "uncojet@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "molecule-desci",
+      "source": ".",
+      "description": "DeSci molecule orchestration (aura-orchestrator + molecule-x402 skills) backed by the molecule MCP server.",
+      "version": "1.0.0"
+    }
+  ]
+}

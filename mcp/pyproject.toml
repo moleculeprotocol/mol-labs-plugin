@@ -1,0 +1,19 @@
+[project]
+name = "molecule-mcp"
+version = "1.0.0"
+description = "stdio MCP server backing the aura-orchestrator and molecule-x402 skills — wraps Privy, POI, Labs GraphQL, the x402 payment flow, S3 uploads, AES-256-GCM envelope crypto, oclId packing, ABI encoding and access conditions."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27",
+    "cryptography>=42",
+    "eth-abi>=5",
+    "eth-utils>=4",
+    "eth-hash[pycryptodome]>=0.5",
+]
+
+[project.scripts]
+molecule-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
