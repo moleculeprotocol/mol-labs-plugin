@@ -9,8 +9,8 @@
     {
       "name": "molecule-desci",
       "source": "./",
-      "description": "DeSci molecule orchestration (aura-orchestrator + molecule-x402 skills) backed by the molecule MCP server.",
-      "version": "0.0.1"
+      "description": "DeSci molecule orchestration (aura-orchestrator + molecule-x402 skills) backed by the molecule MCP server. V2 GraphQL surface, keyed on ipnftUid.",
+      "version": "0.1.0"
     }
   ]
 }

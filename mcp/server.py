@@ -20,14 +20,18 @@ Written in Python (FastMCP) and run over stdio so it works under any
 MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter —
 no Bun/Node required.
 
+This server targets the **V2 GraphQL surface** (the one live on production), keyed on
+``ipnftUid`` (``{contractAddress}_{tokenId}``). The retired OCL surface (``oclId``,
+``initiateCreateOrUpdateFile``/``finishCreateOrUpdateFile``/``createAnnouncement``/``createLab``)
+is intentionally NOT supported here.
+
 Source-of-truth parity (these tools faithfully replicate the real backend):
   - x402 payment flow ........ desci-infra/lambda/x402-gateway-lambda/index.ts
   - x402 mutation whitelist .. desci-infra/lambda/x402-gateway-lambda/mutations.ts
   - AES-256-GCM envelope ..... desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts
-  - oclId packing ............ desci-infra/lambda/common/utils/ocl-id.ts
   - access conditions ........ desci-infra/lambda/common/utils/access-control-conditions.ts
   - GraphQL field shapes ..... desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql
-  - request shapes / auth .... desci-infra/bruno/{desci-labs,service-auth}
+  - request shapes / auth .... desci-infra/bruno/desci-labs/v2 + desci-infra/bruno/service-auth
 
 Transport: stdio. NOTHING is written to stdout except the JSON-RPC protocol —
 FastMCP owns stdout; all diagnostics go to stderr (see ``log``). Secrets
@@ -51,7 +55,7 @@ from typing import Any, Literal
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from eth_abi import encode as abi_encode_values
-from eth_utils import function_signature_to_4byte_selector, to_checksum_address
+from eth_utils import function_signature_to_4byte_selector
 
 from mcp.server.fastmcp import FastMCP
 
@@ -459,33 +463,6 @@ def decrypt_file_impl(file_path: str, iv: str, plaintext_dek: str, out_path: str
 
 
 # --------------------------------------------------------------------------
-# oclId packing — replicates ocl-id.ts packOclId / validateOclId.
-# --------------------------------------------------------------------------
-
-_MAX_TOKEN_ID = (1 << 80) - 1
-
-
-def pack_ocl_id_impl(token_id: int, account: str, version: int = 1, namespace: int = 1) -> str:
-    if not (0 <= version <= 0xFF):
-        raise ToolError("version must be 0–255")
-    if not (0 <= namespace <= 0xFF):
-        raise ToolError("namespace must be 0–255")
-    if not (0 <= token_id <= _MAX_TOKEN_ID):
-        raise ToolError("tokenId must be between 0 and 2^80 - 1")
-    checksummed = to_checksum_address(account)
-    # validateOclId rejects an embedded zero address regardless of tokenId.
-    if int(checksummed, 16) == 0:
-        raise ToolError("Refusing to pack an oclId with a zero address.")
-    packed = (
-        (version << 248)
-        | (namespace << 240)
-        | (token_id << 160)
-        | int(checksummed, 16)
-    )
-    return "0x" + format(packed, "064x")
-
-
-# --------------------------------------------------------------------------
 # access control conditions
 # --------------------------------------------------------------------------
 
@@ -498,31 +475,6 @@ def _chain_for_caip_chain_id(chain_id: int) -> str:
 
 def _raise(exc: Exception):
     raise exc
-
-
-def _ocl_has_role_condition(ocl_id: str, role: int, chain: str, resolver: str) -> list[dict]:
-    # Mirrors access-control-conditions.ts buildOclAccessCondition.
-    return [
-        {
-            "conditionType": "evmContract",
-            "contractAddress": resolver,
-            "chain": chain,
-            "functionName": "hasRole",
-            "functionParams": [ocl_id, ":userAddress", str(role)],
-            "functionAbi": {
-                "name": "hasRole",
-                "inputs": [
-                    {"name": "oclId", "type": "bytes32"},
-                    {"name": "account", "type": "address"},
-                    {"name": "role", "type": "uint8"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "view",
-                "type": "function",
-            },
-            "returnValueTest": {"key": "", "comparator": "=", "value": "true"},
-        }
-    ]
 
 
 def _ipnft_signer_condition(reservation_id: str, chain: str, resolver: str) -> list[dict]:
@@ -815,9 +767,11 @@ def x402_pay(
     TransferWithAuthorization with the Privy wallet -> retry with PAYMENT-SIGNATURE.
     The single top-level GraphQL field in `query` MUST equal `mutation` (the
     gateway's validateMutationQuery enforces this). Returns {data, errors, settlement}.
-    Whitelisted mutations: initiateCreateOrUpdateFile, finishCreateOrUpdateFile,
-    createAnnouncement, createLab (any other mutation 400s with 'not enabled for
-    x402 gateway')."""
+    Whitelisted mutations (the V2 surface, from x402-gateway-lambda/mutations.ts):
+    initiateCreateOrUpdateFileV2, finishCreateOrUpdateFileV2, createAnnouncementV2,
+    createProject, addProjectOwner, generateDataEncryptionKey, decryptDataKey (any
+    other mutation 400s with 'not enabled for x402 gateway'). All data-room args are
+    keyed on ipnftUid ({contractAddress}_{tokenId}) — NOT oclId."""
     return dump(run_x402_pay(mutation, query, variables, gatewayUrl, walletId))
 
 
@@ -855,9 +809,9 @@ def labs_generate_dek(
     """Call generateDataEncryptionKey and KEEP the plaintext DEK inside this
     server. Returns {encryptedDek, encryptionSystem, dekHandle} — pass dekHandle to
     encrypt_file. The plaintext DEK is NEVER returned to the agent. transport='direct'
-    (default, service-token) is the working path. NOTE: generateDataEncryptionKey is
-    NOT in the x402 gateway whitelist (mutations.ts), so transport='x402' will 400
-    until it is added there — use 'direct'."""
+    (default, service-token) is the recommended path — it needs no payment and keeps
+    the DEK in-process. generateDataEncryptionKey IS now x402-whitelisted (mutations.ts),
+    so transport='x402' also works, but prefer 'direct' for DEK generation."""
     query = (
         "mutation GenerateDataEncryptionKey { generateDataEncryptionKey { isSuccess "
         "plaintextDEK encryptedDek encryptionSystem error { message code retryable } } }"
@@ -889,7 +843,7 @@ def labs_generate_dek(
 @mcp.tool()
 def labs_decrypt_dek(
     filePath: str | None = None,
-    oclId: str | None = None,
+    ipnftUid: str | None = None,
     tokenUri: str | None = None,
     agreementUrl: str | None = None,
     transport: Literal["direct", "x402"] = "direct",
@@ -902,19 +856,20 @@ def labs_decrypt_dek(
     the caller) and KEEP the plaintext DEK inside this server. Returns
     {iv, dekHandle, message} — pass dekHandle to decrypt_file.
 
-    The decryptDataKey mutation accepts ONLY oclId/filePath (data-room file) or
-    tokenUri/agreementUrl (IPFS agreement) — there is NO ipnftUid argument. For a
-    data-room file pass oclId + filePath. ACCESS_DENIED means the caller wallet
-    fails the on-chain condition; LEGACY_ENCRYPTION means the file predates the
-    envelope flow. NOTE: decryptDataKey is NOT x402-whitelisted, so transport='x402'
-    will 400 — use 'direct'."""
-    if not oclId and not tokenUri:
-        raise ToolError("Provide oclId (data-room file) or tokenUri (IPFS agreement).")
+    The decryptDataKey mutation (encryption.graphql) accepts ipnftUid + filePath
+    (a data-room file, format {contractAddress}_{tokenId}) or tokenUri + agreementUrl
+    (an IPFS agreement). For a data-room file pass ipnftUid + filePath. ACCESS_DENIED
+    means the caller wallet fails the on-chain condition; LEGACY_ENCRYPTION means the
+    file predates the envelope flow. decryptDataKey IS x402-whitelisted, but
+    transport='direct' (service-token) is recommended so the plaintext DEK stays
+    in-process and no payment is needed."""
+    if not ipnftUid and not tokenUri:
+        raise ToolError("Provide ipnftUid (data-room file) or tokenUri (IPFS agreement).")
     arg_decls, arg_uses, variables = [], [], {}
-    if oclId:
-        arg_decls.append("$oclId: String")
-        arg_uses.append("oclId: $oclId")
-        variables["oclId"] = oclId
+    if ipnftUid:
+        arg_decls.append("$ipnftUid: String")
+        arg_uses.append("ipnftUid: $ipnftUid")
+        variables["ipnftUid"] = ipnftUid
     if filePath:
         arg_decls.append("$filePath: String")
         arg_uses.append("filePath: $filePath")
@@ -992,14 +947,6 @@ def hex_to_uint256(hex: str) -> str:
 
 
 @mcp.tool()
-def pack_ocl_id(tokenId: str, account: str, version: int = 1, namespace: int = 1) -> str:
-    """Pack an oclId from tokenId + ERC-6551 TBA account, replicating ocl-id.ts
-    packOclId (version 0x01, namespace 0x01, 80-bit tokenId, 160-bit address).
-    Rejects a zero embedded address. Returns {oclId} (66-char 0x-hex)."""
-    return dump({"oclId": pack_ocl_id_impl(int(tokenId), account, version, namespace)})
-
-
-@mcp.tool()
 def abi_encode(functionSignature: str, args: list) -> str:
     """ABI-encode a Solidity function call to calldata. functionSignature is e.g.
     'mintReservation(address,uint256,string,string,bytes)' or
@@ -1012,39 +959,30 @@ def abi_encode(functionSignature: str, args: list) -> str:
 
 @mcp.tool()
 def build_access_conditions(
-    mode: Literal["ocl-hasRole", "ipnft-signer"],
+    reservationId: str,
+    mode: Literal["ipnft-signer"] = "ipnft-signer",
     accessResolverAddress: str | None = None,
     chain: str | None = None,
-    oclId: str | None = None,
-    role: int = 1,
-    reservationId: str | None = None,
     chainId: str | None = None,
-    environment: str | None = None,
 ) -> str:
-    """Build the on-chain accessControlConditions array for an encrypted upload, and
+    """Build the on-chain accessControlConditions array for an encrypted V2 upload, and
     return both the array and its JSON-stringified string (ready for
-    encryptionMetadata.accessControlConditions). mode='ocl-hasRole' (molecule-x402):
-    hasRole(oclId, :userAddress, role) — role 1=Viewer (default), 2=Contributor; chain
-    from ENVIRONMENT (production->base else baseSepolia) unless overridden.
-    mode='ipnft-signer' (aura): isAuthorizedSignerForIpnft(:userAddress, reservationId);
-    chain from CHAIN_ID. accessResolverAddress defaults to $ACCESS_RESOLVER_ADDRESS."""
+    encryptionMetadata.accessControlConditions). mode='ipnft-signer' (the only V2 gate):
+    isAuthorizedSignerForIpnft(:userAddress, reservationId), where reservationId is the
+    IP-NFT tokenId (the {tokenId} part of an ipnftUid). Chain is derived from CHAIN_ID
+    (1->ethereum, 11155111->sepolia, 8453->base, 84532->baseSepolia) unless overridden;
+    accessResolverAddress defaults to $ACCESS_RESOLVER_ADDRESS. This replicates the
+    bruno v2 encrypted-upload condition and aura's createAuthorizedIpnftSignerCondition."""
     resolver = accessResolverAddress or env("ACCESS_RESOLVER_ADDRESS")
     if not resolver:
         raise ToolError("accessResolverAddress not given and ACCESS_RESOLVER_ADDRESS is not set.")
-    if mode == "ocl-hasRole":
-        if not oclId:
-            raise ToolError("mode 'ocl-hasRole' requires oclId.")
-        envv = environment or env("ENVIRONMENT")
-        ch = chain or ("base" if envv == "production" else "baseSepolia")
-        conditions = _ocl_has_role_condition(oclId, role, ch, resolver)
-    else:
-        if not reservationId:
-            raise ToolError("mode 'ipnft-signer' requires reservationId.")
-        cid = int(chainId or env("CHAIN_ID") or 0)
-        if not cid:
-            raise ToolError("chainId not given and CHAIN_ID is not set.")
-        ch = chain or _chain_for_caip_chain_id(cid)
-        conditions = _ipnft_signer_condition(reservationId, ch, resolver)
+    if not reservationId:
+        raise ToolError("mode 'ipnft-signer' requires reservationId (the IP-NFT tokenId).")
+    cid = int(chainId or env("CHAIN_ID") or 0)
+    if not cid:
+        raise ToolError("chainId not given and CHAIN_ID is not set.")
+    ch = chain or _chain_for_caip_chain_id(cid)
+    conditions = _ipnft_signer_condition(reservationId, ch, resolver)
     return dump({"conditions": conditions, "json": json.dumps(conditions, separators=(",", ":"))})
 
 

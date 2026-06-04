@@ -1,7 +1,7 @@
 {
   "name": "molecule-desci",
-  "description": "DeSci molecule orchestration for Molecule Labs: POI registration + IP-NFT minting (aura-orchestrator) and x402-paid client-side-encrypted data-room uploads (molecule-x402), backed by the `molecule` MCP server (Privy agentic wallet, full x402 payment flow, AES-256-GCM envelope crypto, oclId packing, ABI encoding, on-chain access conditions).",
-  "version": "0.0.1",
+  "description": "DeSci molecule orchestration for Molecule Labs: POI registration + IP-NFT minting (aura-orchestrator) and x402-paid client-side-encrypted data-room uploads (molecule-x402), backed by the `molecule` MCP server (Privy agentic wallet, full x402 payment flow, AES-256-GCM envelope crypto, ABI encoding, on-chain access conditions). V2 GraphQL surface, keyed on ipnftUid.",
+  "version": "0.1.0",
   "author": {
     "name": "Vladimir Demidov",
     "email": "vladimir@molecule.to"

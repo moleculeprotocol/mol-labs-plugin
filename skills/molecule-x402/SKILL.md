@@ -1,6 +1,6 @@
 ---
 name: molecule-x402
-description: End-to-end (client-side) encrypted file uploads to a Molecule Labs data room, paid per call over the x402 gateway. Generate a KMS-wrapped DEK, AES-256-GCM encrypt the file, upload the ciphertext, finish with on-chain access conditions, and verify decryption — all driven through the `molecule` MCP server (no raw curl/node), with a Privy agentic wallet. Non-V2 GraphQL surface (canonical oclId, not ipnftUid).
+description: End-to-end (client-side) encrypted file uploads to a Molecule Labs data room, paid per call over the x402 gateway. Generate a KMS-wrapped DEK, AES-256-GCM encrypt the file, upload the ciphertext, finish with on-chain access conditions, and verify decryption — all driven through the `molecule` MCP server (no raw curl/node), with a Privy agentic wallet. V2 GraphQL surface (production), keyed on ipnftUid.
 ---
 
 # Molecule x402 — Client-Side Encrypted Data-Room Uploads
@@ -13,23 +13,23 @@ replication of the Labs **Onchain-Verified Envelope Encryption** client
 plaintext or the unwrapped key — only the ciphertext, the KMS-wrapped DEK, and the on-chain access
 conditions are persisted.
 
-The two **billable data-room writes** — `initiateCreateOrUpdateFile` and `finishCreateOrUpdateFile` —
+The two **billable data-room writes** — `initiateCreateOrUpdateFileV2` and `finishCreateOrUpdateFileV2` —
 are paid per call in USDC on Base through the **x402 gateway**. The `mcp__molecule__x402_pay` tool runs
 the **entire** payment handshake (challenge → EIP-712 sign via the Privy wallet → retry with payment) in
 one call — no API key, no manual base64.
 
-The two **crypto-helper mutations** — `generateDataEncryptionKey` and `decryptDataKey` — are **not**
-x402-gated (not billable writes, not whitelisted on the gateway). They are called **directly** against
-the Labs GraphQL endpoint with a **service token** (`x-service-token: $MOLECULE_SERVICE_TOKEN` +
-`x-wallet-address: $EVM_WALLET_ADDRESS`) — exactly the auth the `desci-infra/bruno/desci-labs`
-integration tests use. The `mcp__molecule__labs_generate_dek` and `mcp__molecule__labs_decrypt_dek`
-tools make those direct calls **and keep the plaintext DEK inside the MCP process**, handing back only
-an opaque `dekHandle`. So this skill is **hybrid**: x402 for the uploads (E2/E5), direct service-token
-GraphQL for DEK generation (E0) and decryption (E6).
+The two **crypto-helper mutations** — `generateDataEncryptionKey` and `decryptDataKey` — are now also
+x402-whitelisted, but this skill calls them **directly** against the Labs GraphQL endpoint with a
+**service token** (`x-service-token: $MOLECULE_SERVICE_TOKEN` + `x-wallet-address: $EVM_WALLET_ADDRESS`)
+— exactly the auth the `desci-infra/bruno/desci-labs/v2` integration tests use. Calling them direct needs
+no payment and lets the `mcp__molecule__labs_generate_dek` / `mcp__molecule__labs_decrypt_dek` tools
+**keep the plaintext DEK inside the MCP process**, handing back only an opaque `dekHandle`. So this skill
+is **hybrid**: x402 for the uploads (E2/E5), direct service-token GraphQL for DEK generation (E0) and
+decryption (E6).
 
-This targets the **current (non-V2) GraphQL surface**, keyed on the canonical 32-byte **`oclId`** — not
-the legacy `ipnftUid` (`{address}_{tokenId}`). The legacy `*V2` mutations were retired by the SP6-2
-cutover and are **not** used here.
+This targets the **V2 GraphQL surface** (the one live on production), keyed on the
+**`ipnftUid`** (`{contractAddress}_{tokenId}`). The retired OCL surface (`oclId`,
+`initiateCreateOrUpdateFile`/`finishCreateOrUpdateFile`) is **not** used here — it is not on production.
 
 ---
 
@@ -45,11 +45,11 @@ MCP reads them.
 | `X402_GATEWAY_URL` | settings.json | Base URL of the x402 gateway. `mcp__molecule__x402_pay` reaches `$X402_GATEWAY_URL/x402/labs/<mutation>`. |
 | `MOLECULE_LABS_URL` | settings.json | Labs **GraphQL endpoint** (e.g. `https://staging.graphql.api.molecule.xyz/graphql`). The direct DEK calls (E0/E6) POST here. |
 | `MOLECULE_SERVICE_TOKEN` | settings.local.json | JWT service token for the direct GraphQL calls (`x-service-token`). Mint via `mcp__molecule__mint_service_token` if you don't have one. Secret. |
-| `ACCESS_RESOLVER_ADDRESS` | settings.json | `AccessResolver` (V3) contract address used in `accessControlConditions`. Staging (Base Sepolia): `0x5493F472602C87318EA5Eff753cDD593bf9bF559`. |
-| `CHAIN_ID` | settings.json | Canonical chain id of the lab state (e.g. `8453` Base, `84532` Base Sepolia). Informational; the payment network comes from the 402 challenge. |
-| `ENVIRONMENT` | settings.json | `production` \| `staging` \| `local`. Selects the access-condition chain string (`base` vs `baseSepolia`) and gates the production encryption precondition. |
-| `OCL_ID` | settings.json | _(optional)_ Default target lab `oclId` (66-char `0x`+64 hex). May be passed per run instead. |
-| `EVM_WALLET_ADDRESS` | settings.json | **Required.** Caller wallet — sent as `x-wallet-address` on the direct calls and used for `changeBy`/`encryptedBy`. For E6 decrypt this is the `:userAddress` evaluated against `hasRole`. |
+| `ACCESS_RESOLVER_ADDRESS` | settings.json | IPNFT `AccessResolver` (L1) contract used in `accessControlConditions` for `isAuthorizedSignerForIpnft`. Staging (Sepolia): `0xd9b492fd34b1579C052b2EA25970178B3011Ce6B`. |
+| `CHAIN_ID` | settings.json | Chain id of the IPNFT `AccessResolver` (L1) — selects the access-condition chain string (`1`→`ethereum`, `11155111`→`sepolia`, `8453`→`base`, `84532`→`baseSepolia`). Staging: `11155111`. |
+| `ENVIRONMENT` | settings.json | `production` \| `staging` \| `local`. Informational / gates the production encryption precondition. |
+| `IPNFT_UID` | settings.json | _(optional)_ Default target data room `ipnftUid` (`{contractAddress}_{tokenId}`). May be passed per run instead. |
+| `EVM_WALLET_ADDRESS` | settings.json | **Required.** Caller wallet — sent as `x-wallet-address` on the direct calls and used for `changeBy`/`encryptedBy`. For E6 decrypt this is the `:userAddress` evaluated against `isAuthorizedSignerForIpnft`. |
 | `PRIVY_APP_ID` | settings.local.json | Privy app id (basic-auth user for the wallet RPC). |
 | `PRIVY_APP_SECRET` | settings.local.json | Privy app secret (basic-auth password). |
 | `PRIVY_WALLET_ID` | settings.local.json | Privy server-wallet id that signs the x402 payment authorization. |
@@ -64,7 +64,7 @@ Ready-to-paste skeleton:
   "ACCESS_RESOLVER_ADDRESS": "",
   "CHAIN_ID": "",
   "ENVIRONMENT": "staging",
-  "OCL_ID": "",
+  "IPNFT_UID": "",
   "EVM_WALLET_ADDRESS": ""
 }}
 ```
@@ -92,8 +92,7 @@ the PDF you intend to describe.
 |------|------|
 | Generate the DEK (direct GraphQL, service token) | `mcp__molecule__labs_generate_dek` |
 | AES-256-GCM encrypt / decrypt | `mcp__molecule__encrypt_file` / `mcp__molecule__decrypt_file` |
-| Pack the `oclId` from `tokenId` + TBA account | `mcp__molecule__pack_ocl_id` |
-| Build `accessControlConditions` | `mcp__molecule__build_access_conditions` |
+| Build `accessControlConditions` (ipnft-signer) | `mcp__molecule__build_access_conditions` |
 | x402 paid upload calls (E2, E5) | `mcp__molecule__x402_pay` |
 | PUT the ciphertext to S3 (no payment) | `mcp__molecule__s3_upload` |
 | Resolve the wallet address | `mcp__molecule__privy_get_wallet_address` |
@@ -119,17 +118,18 @@ by `dekHandle`.
 - **Confidential files are never PUBLIC.** `accessLevel` MUST be `HOLDERS` or `ADMIN` (valid values:
   `PUBLIC | HOLDERS | ADMIN`). Uploading a confidential file as plaintext or `PUBLIC` defeats the feature.
 - **Two transport modes — do not mix them up.**
-  - **x402 (E2, E5):** `mcp__molecule__x402_pay` with `mutation = initiateCreateOrUpdateFile` /
-    `finishCreateOrUpdateFile`. The single top-level GraphQL field in `query` must **equal** `mutation`
-    (`validateMutationQuery`). These two are x402-whitelisted in
+  - **x402 (E2, E5):** `mcp__molecule__x402_pay` with `mutation = initiateCreateOrUpdateFileV2` /
+    `finishCreateOrUpdateFileV2`. The single top-level GraphQL field in `query` must **equal** `mutation`
+    (`validateMutationQuery`). These are x402-whitelisted in
     `desci-infra/lambda/x402-gateway-lambda/mutations.ts`.
   - **Direct (E0, E6):** `mcp__molecule__labs_generate_dek` / `labs_decrypt_dek` (transport `direct`,
-    auth `service-token`). `generateDataEncryptionKey` and `decryptDataKey` are intentionally **not**
-    x402-gated — never route them through `x402_pay`.
-- **All data-room args take `oclId`** (canonical 32-byte, lowercase `0x`-hex) — never `ipnftUid`.
-- **Production guard.** On `ENVIRONMENT=production`, the backend refuses to finalize an encrypted file
-  unless `AccessResolver` V3 is live on the canonical chain (`assertOclEncryptionAvailable`). If V3 isn't
-  deployed, the finish step (E5) fails with `OCL_ACCESS_RESOLVER_NOT_DEPLOYED` — surface it verbatim and stop.
+    auth `service-token`). `generateDataEncryptionKey` / `decryptDataKey` are also x402-whitelisted, but
+    keep them **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch.
+- **All data-room args take `ipnftUid`** (`{contractAddress}_{tokenId}`) — never `oclId`.
+- **Production guard.** The backend verifies the caller is an authorized signer for the IP-NFT
+  (`isAuthorizedSignerForIpnft`) on the configured `AccessResolver` chain before it will finalize an
+  encrypted file. If the resolver is unreachable / not deployed on that chain, the finish step (E5)
+  fails with a clear error — surface it verbatim and stop.
 - **Payment is the Privy wallet's job.** `x402_pay` signs the EIP-712 `TransferWithAuthorization` through
   the Privy server-wallet RPC. Never sign with a raw private key.
 
@@ -141,9 +141,10 @@ by `dekHandle`.
    `PRIVY_WALLET_ID` is unset, follow the **`privy-agentic-wallets`** skill
    (`skills/privy-agentic-wallets/SKILL.md`) to create a wallet **with a policy** (single-chain + per-tx
    value cap), then set `PRIVY_WALLET_ID`.
-2. **An existing OnChain Lab** → its `oclId`. This skill does **not** create labs; the OCL must already
-   exist on-chain (provisioned by the OCL factory, which emits `OclIdentityCreated(oclId, tokenId, account)`).
-   If you have `tokenId` + the ERC-6551 TBA `account` but not the packed id, derive it below.
+2. **An existing V2 Lab project** → its `ipnftUid` (`{contractAddress}_{tokenId}`). This skill uploads to
+   an existing data room; it does **not** create projects. The project must already exist (created via
+   `createProject` / the `aura-orchestrator` flow) and the IP-NFT must exist on-chain so the access
+   resolver can verify the signer.
 3. **A file to encrypt** in the workspace.
 4. **A service token** (`MOLECULE_SERVICE_TOKEN`) for the direct E0/E6 calls — see "Obtaining a service
    token" below.
@@ -154,7 +155,9 @@ by `dekHandle`.
 mcp__molecule__privy_get_wallet_address: {}
 ```
 Save the returned `address` as `wallet_address`. It must equal `$EVM_WALLET_ADDRESS` (the
-`x-wallet-address` / `:userAddress` caller for the direct calls).
+`x-wallet-address` / `:userAddress` caller for the direct calls), and that wallet must be an authorized
+signer for the target IP-NFT (the owner, or a Safe / ERC-4337 / ERC-6551 signer of it) — otherwise E6
+decryption is denied.
 
 ### Obtaining a service token
 
@@ -171,21 +174,11 @@ Set the returned `token` as `MOLECULE_SERVICE_TOKEN` in `.claude/settings.local.
 later returns an auth error, the token is missing/expired — re-mint and retry. The token is a secret; the
 MCP never logs it, and neither should you.
 
-### Derive `oclId` from `tokenId` + TBA `account` (only if you don't already have it)
+### Derive the IP-NFT `tokenId` from the `ipnftUid`
 
-Replicates `desci-infra/lambda/common/utils/ocl-id.ts` `packOclId` (version `0x01`, namespace `0x01`,
-10-byte tokenId, 20-byte TBA). `tokenId` must fit in 80 bits.
-
-```
-mcp__molecule__pack_ocl_id:
-  tokenId: "<tokenId>"
-  account: "<tba_account_address>"
-```
-The result (`oclId`, 66 chars, `0x`+64 hex) must match `^0x[0-9a-fA-F]{64}$` and embed a non-zero
-address, or the backend rejects it with `Invalid oclId`.
-
-> A legacy IP-NFT `reservationId` (~256-bit) **cannot** be used as an OCL `tokenId` (80-bit) — these are
-> different on-chain systems. There is no `ipnftUid` on this surface.
+The access condition (E4) needs the IP-NFT **tokenId**, which is the part of the `ipnftUid` after the
+underscore: for `ipnftUid = 0x152B…F61a_280`, the `tokenId` is `280`. No packing/derivation tool is
+needed on the V2 surface.
 
 ---
 
@@ -199,7 +192,7 @@ reports it.
 
 ```
 mcp__molecule__x402_pay:
-  mutation: <initiateCreateOrUpdateFile | finishCreateOrUpdateFile>
+  mutation: <initiateCreateOrUpdateFileV2 | finishCreateOrUpdateFileV2>
   query: "<the GraphQL mutation — single top-level field must equal `mutation`>"
   variables: { ... }
 ```
@@ -241,11 +234,11 @@ it is the upload payload.
 `contentLength` MUST be the ciphertext size (`cipherBytes` from E1).
 ```
 mcp__molecule__x402_pay:
-  mutation: initiateCreateOrUpdateFile
-  query: "mutation InitiateCreateOrUpdateFile($oclId: String!, $contentType: String!, $contentLength: Int!) { initiateCreateOrUpdateFile(oclId: $oclId, contentType: $contentType, contentLength: $contentLength) { uploadToken uploadUrl uploadUrlExpiry method headers { key value } useMultipart isSuccess error { message code retryable } } }"
-  variables: { "oclId": "<oclId>", "contentType": "application/pdf", "contentLength": <cipherBytes> }
+  mutation: initiateCreateOrUpdateFileV2
+  query: "mutation InitiateCreateOrUpdateFileV2($ipnftUid: String!, $contentType: String!, $contentLength: Int!) { initiateCreateOrUpdateFileV2(ipnftUid: $ipnftUid, contentType: $contentType, contentLength: $contentLength) { uploadToken uploadUrl uploadUrlExpiry method headers { key value } useMultipart isSuccess error { message code retryable } } }"
+  variables: { "ipnftUid": "<ipnftUid>", "contentType": "application/pdf", "contentLength": <cipherBytes> }
 ```
-From `data.initiateCreateOrUpdateFile` extract `uploadToken`, `uploadUrl`, `method`, and `headers`.
+From `data.initiateCreateOrUpdateFileV2` extract `uploadToken`, `uploadUrl`, `method`, and `headers`.
 
 ### E3 — PUT the ciphertext to S3 (direct, **no x402**)
 
@@ -260,19 +253,16 @@ mcp__molecule__s3_upload:
   headers: { <each key:value from E2 headers> }
 ```
 
-### E4 — Build `accessControlConditions` (OCL role gate)
+### E4 — Build `accessControlConditions` (ipnft-signer gate)
 
-Replicates `buildOclAccessCondition` — gates decryption on
-`AccessResolver.hasRole(oclId, :userAddress, role)`. `role = 1` (Viewer) is what the
-`desci-infra/bruno/desci-labs` encrypted-upload test uses, and the lab **Owner auto-passes `hasRole`**
-regardless, so the minter can always decrypt; Contributor/Viewer also pass via the on-chain hierarchy.
-Bump to `2` (Contributor) only if you want to exclude plain Viewers. The chain string is derived from
-`ENVIRONMENT` (`production` → `base`, else `baseSepolia`).
+Replicates the bruno v2 encrypted-upload condition — gates decryption on
+`AccessResolver.isAuthorizedSignerForIpnft(:userAddress, <tokenId>)`, so the IP-NFT owner and any
+recursive (Safe / Ownable / ERC-4337 / ERC-6551 TBA) signer can decrypt. `reservationId` is the IP-NFT
+**tokenId** (the part of `ipnftUid` after the underscore). The chain string is derived from `CHAIN_ID`.
 ```
 mcp__molecule__build_access_conditions:
-  mode: ocl-hasRole
-  oclId: "<oclId>"
-  role: 1
+  mode: ipnft-signer
+  reservationId: "<tokenId from ipnftUid>"
 ```
 `:userAddress` is a literal placeholder the backend evaluator substitutes with the authenticated caller —
 the tool keeps it verbatim. Use the returned **`json`** string as `encryptionMetadata.accessControlConditions`
@@ -296,12 +286,12 @@ in E5.
 
 ```
 mcp__molecule__x402_pay:
-  mutation: finishCreateOrUpdateFile
-  query: "mutation FinishCreateOrUpdateFile($oclId: String!, $uploadToken: String!, $path: String, $accessLevel: String!, $changeBy: String!, $description: String, $tags: [String!], $categories: [String!], $encryptionMetadata: EncryptionMetadataInput) { finishCreateOrUpdateFile(oclId: $oclId, uploadToken: $uploadToken, path: $path, accessLevel: $accessLevel, changeBy: $changeBy, description: $description, tags: $tags, categories: $categories, encryptionMetadata: $encryptionMetadata) { datasetId contentHash version newHead isSuccess message error { message code retryable } } }"
-  variables: { "oclId": "<oclId>", "uploadToken": "<from E2>", "path": "<filename>", "accessLevel": "HOLDERS", "changeBy": "<wallet_address>", "description": "<desc>", "categories": ["Science"], "tags": ["Discovery"], "encryptionMetadata": { "encryptionSystem": "<from E0>", "accessControlConditions": "<E4 json string>", "encryptedBy": "<wallet_address>", "encryptedAt": "<ISO-8601 UTC>", "encryptedDek": "<from E0>", "iv": "<from E1>", "contentHash": "<from E1>" } }
+  mutation: finishCreateOrUpdateFileV2
+  query: "mutation FinishCreateOrUpdateFileV2($ipnftUid: String!, $uploadToken: String!, $path: String, $accessLevel: String!, $changeBy: String!, $description: String, $tags: [String!], $categories: [String!], $encryptionMetadata: EncryptionMetadataInput) { finishCreateOrUpdateFileV2(ipnftUid: $ipnftUid, uploadToken: $uploadToken, path: $path, accessLevel: $accessLevel, changeBy: $changeBy, description: $description, tags: $tags, categories: $categories, encryptionMetadata: $encryptionMetadata) { datasetId contentHash version newHead isSuccess message error { message code retryable } } }"
+  variables: { "ipnftUid": "<ipnftUid>", "uploadToken": "<from E2>", "path": "<filename>", "accessLevel": "HOLDERS", "changeBy": "<wallet_address>", "description": "<desc>", "categories": ["Science"], "tags": ["Discovery"], "encryptionMetadata": { "encryptionSystem": "<from E0>", "accessControlConditions": "<E4 json string>", "encryptedBy": "<wallet_address>", "encryptedAt": "<ISO-8601 UTC>", "encryptedDek": "<from E0>", "iv": "<from E1>", "contentHash": "<from E1>" } }
 ```
-From `data.finishCreateOrUpdateFile` extract `datasetId` (`did:odf:…`) and `contentHash`. Note the stored
-data-room `path` (e.g. `/v2-kms-encrypted-….pdf`) — E6 needs it.
+From `data.finishCreateOrUpdateFileV2` extract `datasetId` (`did:odf:…`) and `contentHash`. Note the
+stored data-room `path` (e.g. `/v2-kms-encrypted-….pdf`) — E6 needs it.
 
 ### E6 — Verify decryption (optional, direct **not** x402, replicates `decryptFileWithKms`)
 
@@ -310,15 +300,16 @@ Confirms an authorized caller can recover the file. Fetch the DEK with a **direc
 
 ```
 mcp__molecule__labs_decrypt_dek:
-  oclId: "<oclId>"
+  ipnftUid: "<ipnftUid>"
   filePath: "<data-room path from E5>"
   transport: direct
   auth: service-token
 ```
 - On success: returns `iv` and a fresh `dekHandle`.
-- `isSuccess: false` with `ACCESS_DENIED`: the caller does not satisfy the on-chain `hasRole` condition.
-  The caller is the `x-wallet-address` (`$EVM_WALLET_ADDRESS`) substituted for `:userAddress` — so that
-  wallet must be the lab Owner or hold the required role. Verify you passed the same wallet you encrypted with.
+- `isSuccess: false` with `ACCESS_DENIED`: the caller does not satisfy the on-chain
+  `isAuthorizedSignerForIpnft` condition. The caller is the `x-wallet-address` (`$EVM_WALLET_ADDRESS`)
+  substituted for `:userAddress` — so that wallet must be the IP-NFT owner or an authorized signer.
+  Verify you passed the same wallet you encrypted with.
 - `LEGACY_ENCRYPTION`: the file predates the envelope flow and must be decrypted with the legacy client.
 
 Then decrypt and check round-trip integrity:
@@ -333,24 +324,25 @@ The returned `plaintextSha256` **must equal** the `contentHash` from E1 — that
 
 ---
 
-## Mutation reference (non-V2 surface)
+## Mutation reference (V2 surface)
 
 | Step | Mutation | Tool | Transport | Args (key) | Result fields used |
 |------|----------|------|-----------|------------|--------------------|
 | E0 | `generateDataEncryptionKey` | `labs_generate_dek` | **direct** (`x-service-token`) | _(none)_ | `encryptedDek`, `encryptionSystem`, `dekHandle` |
-| E2 | `initiateCreateOrUpdateFile` | `x402_pay` | **x402** | `oclId, contentType, contentLength` | `uploadToken, uploadUrl, method, headers` |
-| E5 | `finishCreateOrUpdateFile` | `x402_pay` | **x402** | `oclId, uploadToken, path, accessLevel, changeBy, …, encryptionMetadata` | `datasetId, contentHash` |
-| E6 | `decryptDataKey` | `labs_decrypt_dek` | **direct** (`x-service-token`) | `oclId, filePath` | `iv`, `dekHandle` |
+| E2 | `initiateCreateOrUpdateFileV2` | `x402_pay` | **x402** | `ipnftUid, contentType, contentLength` | `uploadToken, uploadUrl, method, headers` |
+| E5 | `finishCreateOrUpdateFileV2` | `x402_pay` | **x402** | `ipnftUid, uploadToken, path, accessLevel, changeBy, …, encryptionMetadata` | `datasetId, contentHash` |
+| E6 | `decryptDataKey` | `labs_decrypt_dek` | **direct** (`x-service-token`) | `ipnftUid, filePath` | `iv`, `dekHandle` |
 
-Only the x402 rows must appear in the gateway whitelist; the direct rows are reached over
-`$MOLECULE_LABS_URL` with `x-service-token` + `x-wallet-address` (handled by the MCP).
+The x402 rows must appear in the gateway whitelist; the direct rows are reached over
+`$MOLECULE_LABS_URL` with `x-service-token` + `x-wallet-address` (handled by the MCP). All four mutations
+are in fact x402-whitelisted — E0/E6 simply stay direct so the plaintext DEK never leaves the MCP.
 
 **Source of truth:**
-- working request shapes & auth — `desci-infra/bruno/desci-labs` (tests 20–25: the encrypted-upload flow) + `desci-infra/bruno/service-auth` (service-token mint) + `desci-infra/bruno/environments/staging.bru`
+- working request shapes & auth — `desci-infra/bruno/desci-labs/v2` (tests 23–27: the encrypted-upload flow) + `desci-infra/bruno/service-auth` (service-token mint) + `desci-infra/bruno/environments/staging.bru`
 - x402 whitelist — `desci-infra/lambda/x402-gateway-lambda/mutations.ts`
-- field signatures — `desci-infra/graphql/schemas/ip-hubs.graphql` (`initiate`/`finish`/`EncryptionMetadataInput`) + `encryption.graphql` (`generateDataEncryptionKey`/`decryptDataKey`)
+- field signatures — `desci-infra/graphql/schemas/ip-hubs.graphql` (`initiateCreateOrUpdateFileV2`/`finishCreateOrUpdateFileV2`/`EncryptionMetadataInput`) + `encryption.graphql` (`generateDataEncryptionKey`/`decryptDataKey`)
+- encryption-metadata validation (KMS required fields) — `desci-infra/lambda/appsync-resolver-labs-lambda/utils/encryption-validator.ts`
 - crypto — `desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts` (12-byte IV, SHA-256 of plaintext — the Bruno tests use placeholder crypto; the MCP uses the real client algorithm)
-- access conditions — `desci-infra/lambda/common/utils/access-control-conditions.ts`
-- oclId packing — `desci-infra/lambda/common/utils/ocl-id.ts`
+- access conditions (`isAuthorizedSignerForIpnft`) — `desci-infra/bruno/desci-labs/v2/25-finishEncryptedFileUploadV2.bru` + `desci-infra/lambda/appsync-resolver-labs-lambda/services/access-resolver-client.ts`
 - gateway routing/headers — `desci-infra/lambda/x402-gateway-lambda/index.ts` (`payment-signature` header; path-field equality)
 - MCP tool reference — `skills/molecule-mcp/README.md`

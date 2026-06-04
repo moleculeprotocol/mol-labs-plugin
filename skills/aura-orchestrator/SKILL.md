@@ -367,53 +367,19 @@ It returns `{ data, errors, settlement }`; read `data.<mutation_name>` and check
 
 **Required env vars (read by the MCP):** `X402_GATEWAY_URL`, `PRIVY_APP_ID`, `PRIVY_APP_SECRET`, `PRIVY_WALLET_ID`.
 
-### V2 → OCL fallback (prod runs V2; staging runs OCL)
+### GraphQL surface (V2, keyed on `ipnftUid`)
 
-There are two live Molecule surfaces. **Production** serves the **V2** mutations keyed on `ipnftUid`
-(`createProject`, `*V2`, `addProjectOwner`). **Staging** serves the newer **OCL** surface keyed on the
-canonical `oclId` (`initiateCreateOrUpdateFile`, `finishCreateOrUpdateFile`, `createAnnouncement`,
-`createLab`). The set a given x402 gateway whitelists depends on which it is.
+Every paid step in Phases 3–6 uses the **V2** mutations keyed on `ipnftUid` (`{contractAddress}_{tokenId}`):
+`createProject`, `initiateCreateOrUpdateFileV2`, `finishCreateOrUpdateFileV2`, `createAnnouncementV2`,
+`addProjectOwner`. These are exactly the mutations whitelisted on the x402 gateway
+(`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), on both staging and production. The retired OCL
+surface (`oclId`, `initiateCreateOrUpdateFile`/`finishCreateOrUpdateFile`/`createAnnouncement`/`createLab`)
+is **not** used — it is not on production.
 
-**Policy for every paid step in Phases 3–6: try the V2 mutation FIRST.** If `x402_pay` reports the
-mutation is not enabled / not whitelisted (HTTP 400 "not enabled for x402 gateway", "No x402 challenge",
-or a GraphQL "unknown field/argument" error), retry the SAME operation with its **OCL equivalent below,
-keyed on `$OCL_ID`** instead of `<ipnft_uid>`. A response that arrives but reports `isSuccess: false` is a
-real business error — do NOT fall back; surface it. Once you fall back to OCL for the upload, stay on OCL
-for the rest of that file (matching `finish` + access-condition mode).
-
-| Operation | V2 (try first — prod) | OCL fallback (staging) | Key V2 → OCL |
-|-----------|------------------------|------------------------|--------------|
-| Create project | `createProject` | `createLab` (registers the pre-provisioned lab at `$OCL_ID`) | `ipnftTokenId` → `oclId` |
-| Initiate upload | `initiateCreateOrUpdateFileV2` | `initiateCreateOrUpdateFile` | `ipnftUid` → `oclId` |
-| Finish upload | `finishCreateOrUpdateFileV2` | `finishCreateOrUpdateFile` | `ipnftUid` → `oclId` |
-| Encrypted access conditions | `build_access_conditions mode: ipnft-signer` (reservationId) | `build_access_conditions mode: ocl-hasRole` (oclId `$OCL_ID`) | reservationId → oclId |
-| Announcement | `createAnnouncementV2` | `createAnnouncement` | `ipnftUid` → `oclId` |
-| Add co-owner | `addProjectOwner` | _(no OCL GraphQL mutation — OCL roles are granted on-chain via AccessResolver V3; the Step C NFT transfer already moves ownership)_ | — |
-
-**OCL fallback query shapes** (used only when the V2 call is rejected; all keyed on `oclId: $OCL_ID`):
-
-```
-# createLab (project fallback)
-mutation CreateLab($input: CreateLabInput!) { createLab(input: $input) { isSuccess message error { message code retryable } lab { oclId symbol } } }
-variables: { "input": { "oclId": "$OCL_ID", "symbol": "<symbol>" } }
-
-# initiateCreateOrUpdateFile (initiate fallback)
-mutation InitiateCreateOrUpdateFile($oclId: String!, $contentType: String!, $contentLength: Int!) { initiateCreateOrUpdateFile(oclId: $oclId, contentType: $contentType, contentLength: $contentLength) { uploadToken uploadUrl uploadUrlExpiry method headers { key value } useMultipart isSuccess error { message code retryable } } }
-variables: { "oclId": "$OCL_ID", "contentType": "application/pdf", "contentLength": <bytes> }
-
-# finishCreateOrUpdateFile (finish fallback — public: omit encryptionMetadata; encrypted: include it)
-mutation FinishCreateOrUpdateFile($oclId: String!, $uploadToken: String!, $path: String, $accessLevel: String!, $changeBy: String!, $description: String, $tags: [String!], $categories: [String!], $encryptionMetadata: EncryptionMetadataInput) { finishCreateOrUpdateFile(oclId: $oclId, uploadToken: $uploadToken, path: $path, accessLevel: $accessLevel, changeBy: $changeBy, description: $description, tags: $tags, categories: $categories, encryptionMetadata: $encryptionMetadata) { datasetId contentHash version newHead isSuccess message error { message code retryable } } }
-variables: { "oclId": "$OCL_ID", "uploadToken": "<from initiate>", "path": "<filename>", "accessLevel": "<PUBLIC|ADMIN>", "changeBy": "<wallet_address>", "description": "<desc>", "categories": ["Science"], "tags": ["Discovery"] }
-
-# createAnnouncement (announcement fallback)
-mutation CreateAnnouncement($oclId: String!, $headline: String!, $body: String!, $attachments: [String!]) { createAnnouncement(oclId: $oclId, headline: $headline, body: $body, attachments: $attachments) { isSuccess error { message code retryable } } }
-variables: { "oclId": "$OCL_ID", "headline": "<title>", "body": "<markdown body>", "attachments": ["<datasetId>"] }
-```
-
-> The encrypted upload (Steps E0–E6) is **identical on both surfaces** — only the `finish` mutation name
-> (`finishCreateOrUpdateFileV2` → `finishCreateOrUpdateFile`), its key (`ipnftUid` → `oclId: $OCL_ID`), and
-> the `build_access_conditions` mode (`ipnft-signer` → `ocl-hasRole`) change. The DEK generation
-> (`labs_generate_dek`, direct/service-token) and the crypto (`encrypt_file`/`decrypt_file`) are surface-agnostic.
+If `x402_pay` reports a mutation is not enabled / not whitelisted (HTTP 400 "not enabled for x402
+gateway", "No x402 challenge"), the gateway is misconfigured for this environment — surface the error and
+stop; do **not** improvise a different surface. A response that arrives but reports `isSuccess: false` is
+a real business error — surface it.
 
 ---
 
@@ -429,8 +395,6 @@ Retrieve `reservationId` from cache if not in context:
 shared_cache: { "operation": "get", "namespace": "molecule", "key": "reservation_id" }
 ```
 
-**Try V2 first** (see **V2 → OCL fallback** above). If the gateway rejects `createProject` as not whitelisted, fall back to `createLab` keyed on `$OCL_ID`.
-
 ```
 mcp__molecule__x402_pay:
   mutation: createProject
@@ -438,7 +402,7 @@ mcp__molecule__x402_pay:
   variables: { "input": { "ipnftSymbol": "<symbol>", "ipnftTokenId": "<reservationId as decimal string>" } }
 ```
 
-_OCL fallback:_ `mutation: createLab` with `variables: { "input": { "oclId": "$OCL_ID", "symbol": "<symbol>" } }` (full query in the fallback section). On OCL the lab at `$OCL_ID` is already provisioned on-chain — `createLab` just registers it.
+From `data.createProject.project` extract `ipnftUid` — every subsequent data-room call is keyed on it.
 
 Extract project URL: `$MOLECULE_CLIENT_URL/ipnfts/{reservationId}`. Cache:
 ```
@@ -469,7 +433,7 @@ mcp__molecule__x402_pay:
   variables: { "ipnftUid": "<ipnft_uid>", "contentType": "application/pdf", "contentLength": <bytes from sha256_file> }
 ```
 
-From `data.initiateCreateOrUpdateFileV2` extract: `uploadToken`, `uploadUrl`, `method`, `headers`. _OCL fallback if not whitelisted:_ `mutation: initiateCreateOrUpdateFile`, key `oclId: $OCL_ID` (see fallback section) — then stay on the OCL `finish` in Step C.
+From `data.initiateCreateOrUpdateFileV2` extract: `uploadToken`, `uploadUrl`, `method`, `headers`.
 
 ### Step B — Upload to S3 (direct, NO x402 payment)
 
@@ -536,8 +500,6 @@ mcp__molecule__x402_pay:
   variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from step A>", "path": "<filename>", "accessLevel": "PUBLIC", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: Science | Business | Governance | Media>"], "tags": ["<one or more correlated tags from the list above>"] }
 ```
 
-_OCL fallback (use only if Step A fell back to OCL):_ `mutation: finishCreateOrUpdateFile`, key `oclId: $OCL_ID` (see fallback section), same variables otherwise.
-
 From `data.finishCreateOrUpdateFileV2` extract: `datasetId` (format: `did:odf:...`), `contentHash`. Cache:
 ```
 shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id", "value": "<datasetId>" }
@@ -550,9 +512,9 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id"
 Use this **instead of** Steps A–C when the file must be confidential. It is a faithful client-side replication of Labs **Onchain-Verified Envelope Encryption** (`encryptFileWithKms`) — same algorithm, IV size, tag handling, and `contentHash` rule (handled by `mcp__molecule__encrypt_file`). The backend never sees plaintext or the unwrapped key; it only stores the ciphertext, the KMS-wrapped DEK, and the on-chain access conditions.
 
 **Preconditions & invariants:**
-- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + `EVM_WALLET_ADDRESS`). `generateDataEncryptionKey` is intentionally **not** in the x402 gateway whitelist (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), so `transport: x402` would return HTTP 400 "not enabled for x402 gateway" — do not use it. (Whitelisting is tracked in Linear IP-2372; until then, direct service-token auth is the only working path. If the service token is missing/expired, the call returns an auth error — stop and report.)
+- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + `EVM_WALLET_ADDRESS`). `generateDataEncryptionKey` is now x402-whitelisted (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), but keep it **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch. If the service token is missing/expired, the call returns an auth error — stop and report.
 - `accessLevel` MUST be `ADMIN` (or `HOLDERS`) — valid values are `PUBLIC | HOLDERS | ADMIN`. Never `PUBLIC` for a confidential file.
-- **Production guard (`assertOclEncryptionAvailable`):** on `production`, the backend refuses to finalize an encrypted file unless `AccessResolver` V3 is live on the canonical chain. If V3 is not deployed, Step E5 fails with `OCL_ACCESS_RESOLVER_NOT_DEPLOYED` ("AccessResolver V3 not deployed on mainnet — refusing to encrypt OCL files until V3 is live"). Surface that message verbatim and stop.
+- **Production guard:** the backend verifies the caller is an authorized signer for the IP-NFT (`isAuthorizedSignerForIpnft`) on the configured `AccessResolver` chain before it will finalize an encrypted file. If the resolver is unreachable / not deployed on that chain, Step E5 fails with a clear error — surface that message verbatim and stop.
 - The plaintext DEK is **one-shot and secret** and **never leaves the MCP** — `labs_generate_dek` hands back only a `dekHandle`. Only `encryptedDek` (wrapped) and the ciphertext are persisted.
 - Crypto matches the Labs client exactly via the MCP: **AES-256-GCM**, **random 12-byte IV**, **128-bit (16-byte) auth tag appended to the ciphertext**, `contentHash` = **hex SHA-256 of the _plaintext_**, DEK = base64 raw 32 bytes (AES-256), `iv` reported base64.
 
@@ -585,7 +547,7 @@ mcp__molecule__x402_pay:
   query: "mutation InitiateCreateOrUpdateFileV2($ipnftUid: String!, $contentType: String!, $contentLength: Int!) { initiateCreateOrUpdateFileV2(ipnftUid: $ipnftUid, contentType: $contentType, contentLength: $contentLength) { uploadToken uploadUrl uploadUrlExpiry method headers { key value } useMultipart isSuccess error { message code retryable } } }"
   variables: { "ipnftUid": "<ipnft_uid>", "contentType": "application/pdf", "contentLength": <cipherBytes> }
 ```
-Extract `uploadToken`, `uploadUrl`, `method`, `headers`. _OCL fallback if not whitelisted:_ `mutation: initiateCreateOrUpdateFile`, key `oclId: $OCL_ID` — and then use the OCL `finish` + `ocl-hasRole` conditions below.
+Extract `uploadToken`, `uploadUrl`, `method`, `headers`.
 
 ### Step E3 — PUT the ciphertext to S3 (direct, NO x402)
 
@@ -609,8 +571,6 @@ mcp__molecule__build_access_conditions:
   reservationId: "<reservationId>"
 ```
 `:userAddress` is a literal placeholder the backend evaluator substitutes — the tool keeps it verbatim. Use the returned **`json`** string as `encryptionMetadata.accessControlConditions` in E5.
-
-_OCL fallback (only if E2 fell back to OCL):_ build the OCL gate instead — `mcp__molecule__build_access_conditions: { mode: ocl-hasRole, oclId: "$OCL_ID", role: 1 }` — and use its `json` in the OCL `finish`.
 
 ### Step E5 — Finalize the encrypted upload (x402 paid)
 
@@ -636,8 +596,6 @@ mcp__molecule__x402_pay:
   variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from E2>", "path": "<filename>", "accessLevel": "ADMIN", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: Science | Business | Governance | Media>"], "tags": ["<one or more correlated tags>"], "encryptionMetadata": { "encryptionSystem": "<from E0>", "accessControlConditions": "<E4 json string>", "encryptedBy": "<wallet_address>", "encryptedAt": "<ISO-8601 UTC>", "encryptedDek": "<from E0>", "iv": "<from E1>", "contentHash": "<from E1>" } }
 ```
 
-_OCL fallback (only if E2 fell back to OCL):_ `mutation: finishCreateOrUpdateFile`, key `oclId: $OCL_ID`, with `accessControlConditions` = the **`ocl-hasRole`** json from the E4 fallback; everything else identical.
-
 From `data.finishCreateOrUpdateFileV2` extract `datasetId` (`did:odf:...`) and `contentHash`, then cache:
 ```
 shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id", "value": "<datasetId>" }
@@ -645,13 +603,13 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id"
 
 ### Step E6 (optional) — Verify decryption (replicates `decryptFileWithKms`)
 
-> **Note:** the `decryptDataKey` mutation accepts `oclId`+`filePath` (a data-room file) or `tokenUri`+`agreementUrl` (an IPFS agreement) — it has **no `ipnftUid` argument**. The pure V2/`ipnftUid` flow above does not produce an `oclId`, so this verification step is only possible when you have the file's canonical `oclId`. If you only have an `ipnftUid`, **skip E6** — it cannot be performed through this mutation.
+The `decryptDataKey` mutation (`encryption.graphql`) accepts `ipnftUid`+`filePath` (a data-room file) or `tokenUri`+`agreementUrl` (an IPFS agreement). For the V2 data-room file uploaded above, pass the `ipnftUid` + the stored data-room `path`.
 
-To confirm an authorized caller can recover the file (when an `oclId` is available), fetch the DEK (the plaintext stays in the MCP) and decrypt locally:
+To confirm an authorized caller can recover the file, fetch the DEK (the plaintext stays in the MCP) and decrypt locally:
 ```
 mcp__molecule__labs_decrypt_dek:
-  oclId: "<oclId of the uploaded file>"
-  filePath: "<filename>"
+  ipnftUid: "<ipnft_uid>"
+  filePath: "<filename / data-room path from E5>"
   transport: direct
   auth: service-token
 ```
@@ -668,16 +626,12 @@ The returned `plaintextSha256` MUST equal the `contentHash` from E1 — that con
 
 ## Phase 5: Create Announcement (via x402)
 
-**Try V2 first.** If `createAnnouncementV2` isn't whitelisted, fall back to `createAnnouncement` keyed on `$OCL_ID` (see fallback section).
-
 ```
 mcp__molecule__x402_pay:
   mutation: createAnnouncementV2
   query: "mutation CreateAnnouncementV2($ipnftUid: String!, $headline: String!, $body: String!, $attachments: [String!]) { createAnnouncementV2(ipnftUid: $ipnftUid, headline: $headline, body: $body, attachments: $attachments) { isSuccess message error { message code retryable } } }"
   variables: { "ipnftUid": "<ipnft_uid>", "headline": "<title>", "body": "<markdown body>", "attachments": ["<datasetId from upload>"] }
 ```
-
-_OCL fallback:_ `mutation: createAnnouncement` with `variables: { "oclId": "$OCL_ID", "headline": "<title>", "body": "<markdown body>", "attachments": ["<datasetId>"] }`.
 
 ### External Posting Copy Rules (Phase 5 body + any Beach.science post)
 
@@ -727,16 +681,16 @@ Save `txHash` as `transfer_tx_hash`.
 
 ### Step D — Add owner as project co-owner (via x402)
 
-**Try V2 first.** `addProjectOwner` is a V2/prod mutation.
+`addProjectOwner` takes `ipnftUid` + `ownerAddress` (per `graphql/schemas/ip-hubs.graphql` and `bruno/desci-labs/v2/2-addProjectOwner.bru`):
 
 ```
 mcp__molecule__x402_pay:
   mutation: addProjectOwner
-  query: "mutation AddProjectOwner($ipnftUid: String!, $walletAddress: String!) { addProjectOwner(ipnftUid: $ipnftUid, walletAddress: $walletAddress) { isSuccess message error { message code retryable } } }"
-  variables: { "ipnftUid": "<ipnft_uid>", "walletAddress": "<owner_wallet>" }
+  query: "mutation AddProjectOwner($ipnftUid: String!, $ownerAddress: String!) { addProjectOwner(ipnftUid: $ipnftUid, ownerAddress: $ownerAddress) { isSuccess message error { message code retryable } } }"
+  variables: { "ipnftUid": "<ipnft_uid>", "ownerAddress": "<owner_wallet>" }
 ```
 
-_OCL has no co-owner GraphQL mutation:_ if `addProjectOwner` isn't whitelisted (you're on the OCL/staging surface), **skip this call** — on OCL, lab ownership/roles are derived on-chain from `AccessResolver` V3 (`RoleGranted`/`RoleRevoked`), and the Step C `safeTransferFrom` already moved the IP-NFT (and thus owner role) to `<owner_wallet>`. Report co-ownership as "granted on-chain via the NFT transfer" in that case.
+Note the Step C `safeTransferFrom` already moved the IP-NFT (and thus owner role) on-chain; `addProjectOwner` additionally whitelists `<owner_wallet>` in the project's off-chain owner list.
 
 ## Output
 

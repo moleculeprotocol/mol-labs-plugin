@@ -83,7 +83,7 @@ arguments** — only file paths, queries, addresses, and the ephemeral `dekHandl
 | `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `build_access_conditions` |
 | `ENVIRONMENT` | settings.json | `build_access_conditions` (base vs baseSepolia) |
 | `EVM_WALLET_ADDRESS` | settings.json | wallet resolution + `x-wallet-address` |
-| `EXPERIMENT_COST_CENTS` / `OCL_ID` | settings.json | (skill body) |
+| `EXPERIMENT_COST_CENTS` | settings.json | (skill body) |
 | `PRIVY_APP_ID` | settings.local.json | all Privy tools (basic-auth user) |
 | `PRIVY_APP_SECRET` | settings.local.json | all Privy tools (basic-auth pass) |
 | `PRIVY_WALLET_ID` | settings.local.json | wallet that signs/sends |
@@ -97,9 +97,9 @@ variable(s) — it never guesses an endpoint or address.
 ### Verify offline
 
 `.venv/bin/python smoke.py` lists all tools and exercises the pure-compute ones — no network or
-secrets required. It regression-checks `hex_to_uint256`, `pack_ocl_id`, and `abi_encode` against
-known-good values, confirms `pack_ocl_id` rejects a zero address, confirms `abi_encode` rejects
-non-`0x` bytes, and round-trips AES-256-GCM encrypt/decrypt.
+secrets required. It regression-checks `hex_to_uint256` and `abi_encode` against known-good values,
+confirms `abi_encode` rejects non-`0x` bytes, builds an `ipnft-signer` access condition, and
+round-trips AES-256-GCM encrypt/decrypt.
 
 ---
 
@@ -141,9 +141,10 @@ internally. The single top-level GraphQL field in `query` **must equal** `mutati
 These wrap the DEK mutations and stash the **plaintext DEK in server memory**, returning an opaque
 `dekHandle` instead. The agent passes the handle to `encrypt_file` / `decrypt_file`, so the
 one-shot secret DEK never enters the conversation, a file, or a log. `labs_decrypt_dek` takes
-`oclId`+`filePath` (data-room file) or `tokenUri`+`agreementUrl` (IPFS agreement) — matching the
-schema; there is **no** `ipnftUid` argument. Both default to `transport='direct'`; the DEK
-mutations are **not** x402-whitelisted, so `transport='x402'` will 400.
+`ipnftUid`+`filePath` (data-room file, `{contractAddress}_{tokenId}`) or `tokenUri`+`agreementUrl`
+(IPFS agreement) — matching `encryption.graphql`. Both DEK mutations are now x402-whitelisted, but
+the tools default to `transport='direct'` (service-token) so the plaintext DEK stays in-process and
+no payment is needed.
 
 ### Crypto / encoding (pure compute)
 
@@ -153,15 +154,15 @@ mutations are **not** x402-whitelisted, so `transport='x402'` will 400.
 | `decrypt_file` | E6 `node -e` decrypt | `{ plaintextSha256, bytes }` |
 | `sha256_file` | `shasum -a 256` / `wc -c` | `{ sha256, bytes }` |
 | `hex_to_uint256` | aura `hex_to_uint256` | `{ decimal, isSmall }` |
-| `pack_ocl_id` | x402 `node -e` packOclId | `{ oclId }` |
 | `abi_encode` | aura `abi_encode` | `{ calldata }` |
-| `build_access_conditions` | E4 access-condition JSON | `{ conditions, json }` |
+| `build_access_conditions` | E4 access-condition JSON (`ipnft-signer`) | `{ conditions, json }` |
 
 `encrypt_file`/`decrypt_file` are byte-for-byte compatible with the Labs client
 `encryptFileWithKms`/`decryptFileWithKms`: AES-256-GCM, random 12-byte IV, 16-byte tag
 **appended** to the ciphertext, `contentHash` = hex SHA-256 of the **plaintext**.
 `abi_encode` rejects non-`0x` `bytes`/`bytesN` arguments (a non-`0x` string would otherwise be
-silently misread as UTF-8). `pack_ocl_id` rejects a zero embedded address.
+silently misread as UTF-8). `build_access_conditions` builds the V2 `isAuthorizedSignerForIpnft`
+gate keyed on the IP-NFT tokenId.
 
 ### Bootstrap
 
@@ -178,8 +179,7 @@ silently misread as UTF-8). `pack_ocl_id` rejects a zero embedded address.
 | x402 challenge / payment header / `PAYMENT-SIGNATURE` | `desci-infra/lambda/x402-gateway-lambda/index.ts` |
 | x402 mutation whitelist | `desci-infra/lambda/x402-gateway-lambda/mutations.ts` |
 | AES-256-GCM envelope (12-byte IV, appended tag, plaintext hash) | `desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts` |
-| `oclId` packing (v1/ns1, 80-bit tokenId, 160-bit TBA) | `desci-infra/lambda/common/utils/ocl-id.ts` |
-| `accessControlConditions` (hasRole) | `desci-infra/lambda/common/utils/access-control-conditions.ts` |
+| `accessControlConditions` (`isAuthorizedSignerForIpnft`) | `desci-infra/lambda/common/utils/access-control-conditions.ts` + `desci-infra/bruno/desci-labs/v2/25-finishEncryptedFileUploadV2.bru` |
 | EIP-712 typed-data `primaryType` | `skills/privy-agentic-wallets/references/transactions.md` |
 | GraphQL field shapes / `EncryptionMetadataInput` / `decryptDataKey` args | `desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql` |
-| Request shapes & auth headers | `desci-infra/bruno/{desci-labs,service-auth}` |
+| Request shapes & auth headers | `desci-infra/bruno/desci-labs/v2` + `desci-infra/bruno/service-auth` |

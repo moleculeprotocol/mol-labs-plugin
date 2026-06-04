@@ -18,10 +18,6 @@ HERE = Path(__file__).resolve().parent
 
 EXPECT = {
     "hex_to_uint256(0x35554760)": ("decimal", "894781280"),
-    "pack_ocl_id(5, acb7..b54)": (
-        "oclId",
-        "0x010100000000000000000005acb7bfa4d926e8df448cd08918a0d38bd6b40b54",
-    ),
     "abi safeTransferFrom": (
         "calldata",
         "0x42842e0e000000000000000000000000acb7bfa4d926e8df448cd08918a0d38bd6b40b54"
@@ -63,10 +59,6 @@ async def main() -> None:
 
             print("hex small:", await call("hex_to_uint256", {"hex": "0x01"}))
 
-            r = await call("pack_ocl_id", {"tokenId": "5", "account": "0xacb7bfa4d926e8df448cd08918a0d38bd6b40b54"})
-            ok &= r["oclId"] == EXPECT["pack_ocl_id(5, acb7..b54)"][1]
-            print("pack_ocl_id:", r)
-
             r = await call("abi_encode", {
                 "functionSignature": "safeTransferFrom(address,address,uint256)",
                 "args": ["0xacb7bfa4d926e8df448cd08918a0d38bd6b40b54", "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", "280"],
@@ -89,23 +81,13 @@ async def main() -> None:
             ok &= rejected
             print("abi rejects non-0x bytes:", rejected)
 
-            r = await call("build_access_conditions", {"mode": "ocl-hasRole", "oclId": "0x0101000000000000000000acb7bfa4d926e8df448cd08918a0d38bd6b40b5405"})
-            ok &= r["conditions"][0]["functionName"] == "hasRole" and r["conditions"][0]["chain"] == "baseSepolia"
-            print("ocl-hasRole ok:", r["conditions"][0]["functionName"], r["conditions"][0]["chain"])
-
             r = await call("build_access_conditions", {"mode": "ipnft-signer", "reservationId": "123456789"})
-            ok &= r["conditions"][0]["functionName"] == "isAuthorizedSignerForIpnft"
+            ok &= r["conditions"][0]["functionName"] == "isAuthorizedSignerForIpnft" and r["conditions"][0]["chain"] == "baseSepolia"
             print("ipnft-signer ok:", r["conditions"][0]["functionName"], r["conditions"][0]["chain"])
 
             r = await call("privy_get_wallet_address", {})  # env path, no network
             ok &= r["address"] == "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c"
             print("privy_get_wallet_address (env, no net):", r)
-
-            # zero-address oclId must be rejected
-            z = await session.call_tool("pack_ocl_id", {"tokenId": "5", "account": "0x0000000000000000000000000000000000000000"})
-            zrej = z.isError or ("zero address" in z.content[0].text)
-            ok &= zrej
-            print("pack_ocl_id rejects zero address (tokenId!=0):", zrej)
 
             # round-trip encrypt/decrypt via dekHandle (no network: inject a fake DEK)
             import base64 as b64
