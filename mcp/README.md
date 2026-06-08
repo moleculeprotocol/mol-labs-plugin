@@ -1,8 +1,10 @@
 # molecule-mcp
 
 A single **stdio MCP server** that backs the [`aura-orchestrator`](../aura-orchestrator/SKILL.md)
-and [`molecule-x402`](../molecule-x402/SKILL.md) skills. Every `curl` / `http_request` / `node -e`
-step in those skills is now a typed MCP tool, so the agent calls **one tool per operation**
+skill (POI → mint → project → public *or* private/encrypted data-room upload → announce → transfer)
+and the [`privy-agentic-wallets`](../privy-agentic-wallets/SKILL.md) helper. Every `curl` /
+`http_request` / `node -e` step in those skills is now a typed MCP tool, so the agent calls **one
+tool per operation**
 instead of hand-assembling shell commands, base64 dances, and EIP-712 payloads.
 
 - **Language:** Python (FastMCP) — chosen over Bun/Node so the plugin runs under **any**
@@ -76,7 +78,7 @@ arguments** — only file paths, queries, addresses, and the ephemeral `dekHandl
 | Variable | Where | Used by |
 |----------|-------|---------|
 | `MOLECULE_CLIENT_URL` | settings.json | `poi_register` |
-| `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `mint_service_token` |
+| `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `issue_service_token` |
 | `X402_GATEWAY_URL` | settings.json | `x402_pay` |
 | `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions` |
 | `IPNFT_CONTRACT_ADDRESS` | settings.json | (skill body) |
@@ -164,11 +166,31 @@ no payment is needed.
 silently misread as UTF-8). `build_access_conditions` builds the V2 `isAuthorizedSignerForIpnft`
 gate keyed on the IP-NFT tokenId.
 
+### Confidentiality latch (fail-closed privacy guard)
+
+A confidential file must never fall back to a public upload if the encrypted path fails — that would
+publish the resource in plaintext. The skill instructs the agent accordingly, but instructions are
+not a guarantee, so the server enforces it at the tool boundary, **non-overridably** (no force flag):
+
+- `encrypt_file` records the **plaintext SHA-256** (and resolved path) of the file it encrypts.
+  `s3_upload` then **refuses** to PUT any bytes whose SHA-256 (or path) matches — the plaintext of a
+  file the agent encrypted can never reach S3, regardless of `accessLevel` or which upload path the
+  agent takes. Uploading the `.enc` ciphertext, the cover image, or a genuinely-public file is
+  unaffected (different bytes / never encrypted).
+- `build_access_conditions` records the IP-NFT **tokenId**. `x402_pay` then **refuses**
+  `finishCreateOrUpdateFileV2` for that tokenId when `accessLevel` is `PUBLIC` or `encryptionMetadata`
+  is missing — a molecule whose access conditions were built can only be finalized non-PUBLIC + encrypted.
+
+The latch is process-local (cleared on subprocess restart, like the DEK store) and keyed on exact
+plaintext bytes + tokenId, so it has no false positives for legitimate public uploads or for a
+different molecule handled in the same session.
+
 ### Bootstrap
 
 | Tool | Replaces | Returns |
 |------|----------|---------|
-| `mint_service_token` | service-token mint (3-step flow) | `{ token, tokenId, expiresAt }` |
+| `issue_service_token` | issue an off-chain JWT service token bound to the Privy AGENT wallet (3-step flow) | `{ token, tokenId, expiresAt }` |
+| `issue_owner_service_token` | issue an off-chain JWT service token bound to the OWNER EOA (signs with `WALLET_PRIVATE_KEY`) | `{ token, tokenId, address, expiresAt }` |
 
 ---
 

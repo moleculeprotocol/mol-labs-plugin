@@ -16,6 +16,7 @@ metadata:
     - PRIVY_WALLET_ID
     - POI_API_KEY
     - MOLECULE_API_KEY
+    - MOLECULE_SERVICE_TOKEN
 ---
 
 # Aura Orchestrator
@@ -35,6 +36,7 @@ Every network, on-chain, and crypto operation runs through the **`molecule` MCP 
 - Follow every URL, contract address, and function signature in this document EXACTLY. Do NOT guess or fabricate alternatives. URLs and contract addresses come from `.env`, read by the MCP — never hardcode.
 - Use the x402 payment flow for ALL Molecule mutations (project creation, file uploads, announcements, ownership) via `mcp__molecule__x402_pay` — one call runs the whole P1–P7 handshake.
 - For **private / confidential** files, use the Private / Encrypted Upload variant in Phase 4 (Steps E0–E5) **instead of** the public Steps A–C: generate a one-shot DEK (kept inside the MCP), AES-256-GCM encrypt locally, upload the ciphertext, and finish with `encryptionMetadata` + a non-PUBLIC `accessLevel`. NEVER upload a confidential file as plaintext or with `accessLevel: PUBLIC`.
+- **FAIL CLOSED — no public fallback for confidential files.** Once a file is chosen for the Private / Encrypted variant, if **any** step (E0 DEK generation, E1 encryption, E2/E3 ciphertext upload, E4 access conditions, E5 finalize, E6 verify) fails and you cannot fix it in-path, **ABORT the entire molecule and report the error.** Do **NOT** "recover" by running the public Steps A–C, do **NOT** re-upload with `accessLevel: PUBLIC`, and do **NOT** `s3_upload` the plaintext PDF — ever. A confidential file leaking to public is a far worse outcome than a failed run. This is also enforced in code: `encrypt_file` arms a non-overridable MCP guard that refuses to S3-upload that file's plaintext, and `build_access_conditions` arms a guard that refuses to finalize that IP-NFT as `PUBLIC` / without `encryptionMetadata`. Do not attempt to work around these guards — they are the safety net, not the plan.
 - The plaintext DEK is single-use and secret. It **never leaves the MCP** — `labs_generate_dek` returns only an opaque `dekHandle`. NEVER attempt to obtain, cache, or log the plaintext DEK. Only the wrapped `encryptedDek` and the ciphertext are persisted.
 - AES-256-GCM encrypt/decrypt is handled by `mcp__molecule__encrypt_file`/`decrypt_file` (it replicates the Labs Web Crypto `encryptFileWithKms`). PDF reading still uses `read_file` — never python/pip/pdftotext.
 - Phases executed sequentially without stopping or reporting intermediate progress.
@@ -47,6 +49,7 @@ Every network, on-chain, and crypto operation runs through the **`molecule` MCP 
 | `PRIVY_APP_SECRET` | Privy secret key — basic-auth password for the Privy wallet RPC |
 | `PRIVY_WALLET_ID` | Privy wallet ID (auto-detected or set after wallet creation) |
 | `EVM_WALLET_ADDRESS` | Owner's personal wallet address for NFT transfer (optional — skip transfer if not set) |
+| `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** JWT service token for the direct (non-x402) DEK generate/decrypt calls (`x-service-token`). Not needed for public uploads. If missing/expired when running the Private variant, issue one with `mcp__molecule__issue_service_token` (see Phase 4 Private variant). Secret — keep in `settings.local.json`. |
 
 **Note:** The MCP server reads all URLs, contract addresses, API keys, and secrets from the environment
 (`.claude/settings.json` for non-secrets, `.claude/settings.local.json` for secrets), which Claude Code
@@ -59,6 +62,11 @@ edit only — never modify the skill body for environment changes.
 - A research PDF file in the workspace (e.g. `.tengu-attachments/document.pdf`)
 - An optional cover image (PNG/JPG) in `.tengu-attachments/`
 - Title, description, symbol, organization, lead name, lead email, topic — derived from the research document
+- **Upload visibility** — the one knob that changes Phase 4. Pick ONE:
+  1. **Public file upload** (default) — the file is stored as plaintext with `accessLevel: PUBLIC`. Run Phase 4 Steps A–C.
+  2. **Private file upload** (confidential / encrypted) — the file is AES-256-GCM envelope-encrypted client-side, stored as ciphertext with a non-PUBLIC `accessLevel` and on-chain access conditions. Run Phase 4 Private variant Steps E0–E6 **instead of** A–C. This path additionally needs `MOLECULE_SERVICE_TOKEN` (see below).
+
+  Everything else (Phases 0–3, 5, 6) is identical for both options, and **x402 payment is used for both** (`initiateCreateOrUpdateFileV2` / `finishCreateOrUpdateFileV2` are paid per call regardless of visibility). If the caller does not specify, default to **public**.
 
 ## Phase 0: Wallet Setup
 
@@ -413,6 +421,8 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "project_url
 
 By default a file is uploaded **PUBLIC** via Steps A–C. If the file must be **private / confidential** (encrypted at rest, access-controlled), use the **Private / Encrypted Upload** variant (Steps E0–E6) at the end of this phase *instead of* Steps A–C. Choose ONE path per file; do not run both.
 
+**The path choice is irreversible mid-flight.** If you started the Private / Encrypted variant for this file, you may NEVER switch to Steps A–C for it. A failure anywhere in E0–E6 means **abort and report** — see the FAIL CLOSED rule above. The public path is only valid for files that were public from the start, never as a fallback for a failed confidential upload.
+
 **Wait 90 seconds** after project creation — data room provisioning is async:
 ```
 Bash: sleep 90
@@ -512,7 +522,13 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id"
 Use this **instead of** Steps A–C when the file must be confidential. It is a faithful client-side replication of Labs **Onchain-Verified Envelope Encryption** (`encryptFileWithKms`) — same algorithm, IV size, tag handling, and `contentHash` rule (handled by `mcp__molecule__encrypt_file`). The backend never sees plaintext or the unwrapped key; it only stores the ciphertext, the KMS-wrapped DEK, and the on-chain access conditions.
 
 **Preconditions & invariants:**
-- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + `EVM_WALLET_ADDRESS`). `generateDataEncryptionKey` is now x402-whitelisted (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), but keep it **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch. If the service token is missing/expired, the call returns an auth error — stop and report.
+- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + `EVM_WALLET_ADDRESS`). `generateDataEncryptionKey` is now x402-whitelisted (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), but keep it **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch. If the service token is missing/expired, the call returns an auth error — issue a fresh one and retry:
+  ```
+  mcp__molecule__issue_service_token:
+    serviceName: data-sync-service
+    expiresIn: "720h"
+  ```
+  Set the returned `token` — an **off-chain JWT** (issued by `generateServiceToken` after a wallet signature; *not* an on-chain mint) — as `MOLECULE_SERVICE_TOKEN` in `.claude/settings.local.json` (the tool runs `getServiceSignInMessage` → `personal_sign` via the Privy wallet → `generateServiceToken`; no Privy session needed). The token is a secret — the MCP never logs it, and neither should you.
 - `accessLevel` MUST be `ADMIN` (or `HOLDERS`) — valid values are `PUBLIC | HOLDERS | ADMIN`. Never `PUBLIC` for a confidential file.
 - **Production guard:** the backend verifies the caller is an authorized signer for the IP-NFT (`isAuthorizedSignerForIpnft`) on the configured `AccessResolver` chain before it will finalize an encrypted file. If the resolver is unreachable / not deployed on that chain, Step E5 fails with a clear error — surface that message verbatim and stop.
 - The plaintext DEK is **one-shot and secret** and **never leaves the MCP** — `labs_generate_dek` hands back only a `dekHandle`. Only `encryptedDek` (wrapped) and the ciphertext are persisted.
@@ -613,7 +629,16 @@ mcp__molecule__labs_decrypt_dek:
   transport: direct
   auth: service-token
 ```
-Returns `iv` and a fresh `dekHandle` on success. A `LEGACY_ENCRYPTION` message means the file predates the envelope flow; `ACCESS_DENIED` means the caller's wallet does not satisfy the access conditions.
+Returns `iv` and a fresh `dekHandle` on success. A `LEGACY_ENCRYPTION` message means the file predates the envelope flow; `ACCESS_DENIED` means the decrypt caller does not satisfy the on-chain `isAuthorizedSignerForIpnft` condition.
+
+**IMPORTANT — the decrypt caller is NOT the `x-wallet-address` header.** When a service token is present (it always is here), the backend substitutes the **service token's `adminAddress`** for `:userAddress` (`appsync-resolver-labs-lambda/index.ts` `case "decryptDataKey"` → `serviceContext.adminAddress`; evaluated by `services/condition-evaluator.ts`). So to decrypt *as* a given wallet you must present a `MOLECULE_SERVICE_TOKEN` **bound to that wallet** — issue one for the Privy agent with `mcp__molecule__issue_service_token`, or for the owner EOA with `mcp__molecule__issue_owner_service_token` (signs the sign-in message with `WALLET_PRIVATE_KEY`), and pass it via the per-call `serviceToken` override:
+```
+mcp__molecule__labs_decrypt_dek:
+  ipnftUid: "<ipnft_uid>"
+  filePath: "<filename / data-room path from E5>"
+  serviceToken: "<token bound to the wallet you want to decrypt as>"
+```
+That wallet must be the IP-NFT owner or an authorized signer on the configured resolver.
 
 ```
 mcp__molecule__decrypt_file:
@@ -691,6 +716,15 @@ mcp__molecule__x402_pay:
 ```
 
 Note the Step C `safeTransferFrom` already moved the IP-NFT (and thus owner role) on-chain; `addProjectOwner` additionally whitelists `<owner_wallet>` in the project's off-chain owner list.
+
+### Step E — Owner decrypt access (private / encrypted uploads only)
+
+Skip for public uploads. For a **private** upload (Phase 4 Private variant), the owner must be able to decrypt — and **project membership alone does NOT grant decryption**: the off-chain owner list from Step D is **not** consulted by the decrypt condition-evaluator. Decryption is gated by `isAuthorizedSignerForIpnft(:userAddress, <reservationId>)` evaluated against the caller's **service-token `adminAddress`** (see Phase 4 Step E6). So ensure the owner satisfies that condition by either:
+
+- the Step C `safeTransferFrom` above — once the owner holds the IP-NFT they ARE the authorized signer (the common path); **or**
+- if the IP-NFT was not transferred to them, make the file's `encryptionMetadata.accessControlConditions` an **OR** that also authorizes the owner (Lit unified format `[cond, {"operator":"or"}, cond]`, e.g. OR a second `isAuthorizedSignerForIpnft(:userAddress, <a tokenId the owner owns>)`). The evaluator supports boolean operators but only contract-call conditions (no bare address-equality), so the owner must be an authorized signer of *some* IP-NFT.
+
+The owner then decrypts by presenting an owner-bound service token (no env swap needed) — `mcp__molecule__issue_owner_service_token: {}` then pass its `token` to `labs_decrypt_dek` via the `serviceToken` override, as in Step E6.
 
 ## Output
 

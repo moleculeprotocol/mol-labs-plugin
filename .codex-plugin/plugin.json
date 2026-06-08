@@ -1,7 +1,7 @@
 {
   "name": "molecule-desci",
   "version": "0.1.0",
-  "description": "DeSci molecule orchestration for Molecule Labs: POI registration + IP-NFT minting (aura-orchestrator) and x402-paid client-side-encrypted data-room uploads (molecule-x402), backed by the `molecule` MCP server. V2 GraphQL surface, keyed on ipnftUid.",
+  "description": "DeSci molecule orchestration for Molecule Labs in one skill (aura-orchestrator): POI registration + IP-NFT minting + project creation + x402-paid data-room file upload (public or client-side-encrypted) + announcement + transfer, backed by the `molecule` MCP server. V2 GraphQL surface, keyed on ipnftUid.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
 }

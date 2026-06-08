@@ -1,12 +1,15 @@
 # molecule-desci — cross-harness plugin
 
-Packages the two DeSci skills + the `molecule` MCP server into one installable plugin that works
-under **Claude Code** and **OpenAI Codex** (and any MCP host, via the server alone).
+Packages the DeSci orchestration skill (+ a wallet helper) and the `molecule` MCP server into one
+installable plugin that works under **Claude Code** and **OpenAI Codex** (and any MCP host, via the
+server alone).
 
-- **`aura-orchestrator`** — POI registration → IP-NFT minting → project creation → file upload
-  (public or encrypted) → announcement → transfer. V2 surface, keyed on `ipnftUid`.
-- **`molecule-x402`** — client-side-encrypted data-room uploads to an existing project (V2/`ipnftUid`),
-  paid per call via x402.
+- **`aura-orchestrator`** — the whole molecule in one skill: POI registration → IP-NFT minting → project
+  creation → data-room file upload → announcement → transfer. V2 surface, keyed on `ipnftUid`. The file
+  upload (Phase 4) is the only branch: choose **public** (plaintext) or **private** (client-side
+  AES-256-GCM envelope-encrypted, access-controlled) — **x402 pays per call either way**.
+- **`privy-agentic-wallets`** — helper for creating/managing the Privy server wallet (with a policy) that
+  signs payments and on-chain transactions. Run once if `PRIVY_WALLET_ID` is unset.
 - **`molecule` MCP server** (`mcp/server.py`, Python/FastMCP, stdio) — Privy wallet ops, POI, Labs
   GraphQL, the full x402 payment flow, S3 upload, AES-256-GCM envelope crypto, ABI encoding, on-chain
   access conditions (`isAuthorizedSignerForIpnft`).
@@ -20,12 +23,13 @@ molecule-plugin/
 ├── .claude-plugin/{plugin.json, marketplace.json}   # Claude Code
 ├── .codex-plugin/plugin.json                         # Codex
 ├── .mcp.json                                         # shared MCP server config (uv run)
-├── skills/{aura-orchestrator,molecule-x402,privy-agentic-wallets}/SKILL.md
+├── skills/{aura-orchestrator,privy-agentic-wallets}/SKILL.md
 └── mcp/{server.py,pyproject.toml,requirements.txt,README.md,smoke.py}
 ```
 
-The canonical, edit-here sources live in `../skills/…` and `../skills/molecule-mcp/`. This directory is
-the packaged form — run `./sync-from-source.sh` after editing the sources to refresh it.
+This plugin directory is the **single source of truth** — it is the only version-controlled copy, so
+edit the skills (`skills/<name>/SKILL.md`) and the MCP server (`mcp/`) here directly. (Older unversioned
+copies under `molecule_core/skills/` are no longer synced and may be stale — ignore them.)
 
 ---
 
@@ -53,7 +57,7 @@ the per-tool breakdown.
 ```bash
 claude --plugin-dir /abs/path/to/molecule-plugin
 ```
-Then `/molecule-desci:molecule-x402` etc. Use `/reload-plugins` after edits.
+Then `/molecule-desci:aura-orchestrator` etc. Use `/reload-plugins` after edits.
 
 **Via marketplace (distribution):** push this dir to a git repo, then in Claude Code:
 ```
@@ -118,19 +122,25 @@ order; this is the cross-skill map.
 2. **Wallet** → run **`privy-agentic-wallets`** *only if* `PRIVY_WALLET_ID` is unset. It creates a Privy
    server wallet **with a policy** (single-chain + per-tx value cap); set the returned `PRIVY_WALLET_ID`.
    Then **fund** that wallet: USDC on Base (x402 pays per call) + native gas on the mint chain.
-3. **Service token** → ensure `MOLECULE_SERVICE_TOKEN` is set, or mint one with the MCP `mint_service_token`
-   tool. Both skills use it for the direct DEK calls (`labs_generate_dek` / `labs_decrypt_dek`).
+3. **Service token** (private uploads only) → ensure `MOLECULE_SERVICE_TOKEN` is set, or issue one with the
+   MCP `issue_service_token` tool. This is an **off-chain JWT** (issued by `generateServiceToken` after a
+   wallet signature — *not* an on-chain mint). The Phase 4 **private** variant uses it for the direct DEK
+   calls (`labs_generate_dek` / `labs_decrypt_dek`). Not needed for public uploads.
 
-### Step 1 — Pick ONE workflow
+### Step 1 — Run `aura-orchestrator`, choosing the upload visibility
 
-| You want to… | Run | Needs |
-|--------------|-----|-------|
-| Register a discovery end-to-end (POI → mint → project → upload → announce → transfer) | **`aura-orchestrator`** | funded wallet + service token; a research PDF |
-| Add a private/encrypted file to an **existing** project | **`molecule-x402`** | the project's `ipnftUid` (already minted) |
+There is **one** workflow — `aura-orchestrator` — and it covers everything end-to-end (POI → mint →
+project → upload → announce → transfer). The only choice is the **Phase 4 upload visibility**:
 
-> `molecule-x402` is essentially `aura-orchestrator`'s Phase 4 *encrypted* variant, extracted as a
-> stand-alone skill. Use **aura** to create everything from scratch; use **x402** when the IP-NFT /
-> project already exists and you only need to attach a confidential file.
+| Upload visibility | What Phase 4 does | Needs |
+|-------------------|-------------------|-------|
+| **Public** (default) | Plaintext file, `accessLevel: PUBLIC`, Steps A–C | funded wallet; a research PDF |
+| **Private** (encrypted) | Client-side AES-256-GCM envelope encryption, non-PUBLIC `accessLevel` + on-chain access conditions, Steps E0–E6 | funded wallet + `MOLECULE_SERVICE_TOKEN`; a research PDF |
+
+> **x402 pays per call for both** — `initiateCreateOrUpdateFileV2` / `finishCreateOrUpdateFileV2` are
+> billed regardless of visibility. Everything outside Phase 4 (POI, mint, project, announcement, transfer)
+> is identical for both. The private variant additionally needs a service token (for the direct, unpaid
+> DEK generate/decrypt calls that keep the plaintext key inside the MCP).
 
 ### `aura-orchestrator` — phase order (do not reorder or skip)
 
@@ -145,7 +155,9 @@ Phase 6  Transfer IP-NFT + addProjectOwner   (optional co-owner)
 Every phase consumes the previous phase's output (`reservationId` → `ipnftUid` → `datasetId`). The two
 **90-second waits** are real: on-chain ownership and data-room provisioning are async.
 
-### `molecule-x402` — step order (strict E0 → E6)
+### `aura-orchestrator` Phase 4 — private (encrypted) variant (strict E0 → E6)
+
+Run these **instead of** Phase 4 Steps A–C when the upload visibility is **private**:
 
 ```
 E0  labs_generate_dek (direct)        → encryptedDek, dekHandle      [no payment]
@@ -161,8 +173,8 @@ the MCP — only the opaque `dekHandle` is passed between E0→E1 and E6.
 
 ## ⚠️ Running cost
 
-`molecule-x402` and `aura-orchestrator` Phases 3–6 perform **paid x402 mutations — real USDC on Base per
-call** — and on-chain transactions (mint/transfer). They need a funded Privy wallet, a valid service
-token / API key, and (for `molecule-x402`) an existing V2 project (`ipnftUid`). For a no-spend smoke, use
+`aura-orchestrator` Phases 3–6 perform **paid x402 mutations — real USDC on Base per call** — and
+on-chain transactions (mint/transfer). They need a funded Privy wallet and a valid service token / API
+key (the **private** upload variant also needs `MOLECULE_SERVICE_TOKEN`). For a no-spend smoke, use
 only the compute/direct tools (`encrypt_file`/`decrypt_file`, `build_access_conditions`, `sha256_file`;
 `labs_generate_dek` needs only a service token, no payment).

@@ -13,8 +13,9 @@
 """molecule-mcp — stdio MCP server for the Molecule DeSci skills.
 
 Replaces every ``curl`` / ``http_request`` / ``node -e`` step in the
-``aura-orchestrator`` and ``molecule-x402`` skills with a typed MCP tool, so the
-agent calls one tool per operation instead of hand-assembling shell commands.
+``aura-orchestrator`` skill (public and private/encrypted data-room uploads)
+with a typed MCP tool, so the agent calls one tool per operation instead of
+hand-assembling shell commands.
 
 Written in Python (FastMCP) and run over stdio so it works under any
 MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter —
@@ -210,18 +211,122 @@ def get_dek(handle: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Confidentiality latch — fail-closed privacy guard.
+#
+# The aura skill instructs the agent never to fall back to a public upload when
+# the private/encrypted path fails. Instructions are not a guarantee, so this
+# latch makes the breach *physically impossible* at the tool boundary: the
+# moment the agent declares a file confidential (by encrypting it, or by
+# building on-chain access conditions for its IP-NFT) we refuse, for the rest
+# of this process, to (a) S3-upload that file's plaintext bytes or (b) finalize
+# that IP-NFT as PUBLIC / without encryptionMetadata. Process-local and
+# NON-overridable — there is deliberately no force flag, because the whole
+# point is that an agent under "just finish the upload" pressure cannot opt out.
+#
+# Known limits (disclosed, not bugs): the latch lives in memory, so an MCP
+# subprocess restart clears it — but a restart also wipes the DEK store and
+# breaks the run, forcing a re-run from a clean state. It is keyed on the exact
+# plaintext bytes, so re-encoding the plaintext to different bytes before upload
+# would evade the hash check — the per-IP-NFT finalize guard still covers that
+# molecule.
+# --------------------------------------------------------------------------
+
+_confidential_plaintext_hashes: set[str] = set()  # hex sha256 of plaintext the agent encrypted
+_confidential_plaintext_paths: set[str] = set()  # resolved abs paths passed to encrypt_file
+_confidential_token_ids: set[str] = set()  # IP-NFT tokenIds that got on-chain access conditions
+
+
+def mark_confidential_plaintext(file_path: str, plaintext_sha256_hex: str) -> None:
+    """Latch a file as confidential once the agent encrypts it. Its plaintext
+    may never again be S3-uploaded by this process."""
+    _confidential_plaintext_hashes.add(plaintext_sha256_hex.lower())
+    try:
+        _confidential_plaintext_paths.add(str(Path(file_path).resolve()))
+    except OSError:
+        pass
+
+
+def mark_confidential_token_id(token_id: str | None) -> None:
+    """Latch an IP-NFT tokenId as confidential once on-chain access conditions
+    are built for it. It may never be finalized PUBLIC / without encryption."""
+    if token_id and str(token_id).strip():
+        _confidential_token_ids.add(str(token_id).strip())
+
+
+def _token_id_from_ipnft_uid(ipnft_uid: str | None) -> str | None:
+    """An ipnftUid is `{contractAddress}_{tokenId}`; return the tokenId part."""
+    if not ipnft_uid or "_" not in ipnft_uid:
+        return None
+    return ipnft_uid.rsplit("_", 1)[1].strip()
+
+
+def assert_not_confidential_plaintext(file_path: str, data: bytes) -> None:
+    """Fail-closed gate for S3 uploads: refuse to PUT the plaintext of a file
+    the agent encrypted for a confidential upload (catches both a path reuse and
+    a byte-identical copy at a different path)."""
+    upload_sha = hashlib.sha256(data).hexdigest().lower()
+    try:
+        resolved = str(Path(file_path).resolve())
+    except OSError:
+        resolved = None
+    if upload_sha in _confidential_plaintext_hashes or (
+        resolved is not None and resolved in _confidential_plaintext_paths
+    ):
+        raise ToolError(
+            "PRIVACY GUARD (non-overridable): refusing to S3-upload the plaintext of a "
+            "file that was encrypted for a confidential upload. The private/encrypted "
+            "upload MUST NOT fall back to a public upload. Upload the '.enc' ciphertext "
+            "instead, or abort the run and report the failure — never publish this "
+            "file's plaintext."
+        )
+
+
+def assert_confidential_finalize_ok(variables: dict[str, Any] | None) -> None:
+    """Fail-closed gate for finishCreateOrUpdateFileV2: if on-chain access
+    conditions were built for this IP-NFT, refuse a PUBLIC / unencrypted
+    finalize."""
+    v = variables or {}
+    token_id = _token_id_from_ipnft_uid(v.get("ipnftUid"))
+    if not token_id or token_id not in _confidential_token_ids:
+        return
+    access_level = str(v.get("accessLevel") or "").upper()
+    has_enc_meta = bool(v.get("encryptionMetadata"))
+    if access_level == "PUBLIC" or not has_enc_meta:
+        raise ToolError(
+            f"PRIVACY GUARD (non-overridable): refusing to finalize IP-NFT tokenId "
+            f"{token_id} with accessLevel={access_level or 'MISSING'} / "
+            f"encryptionMetadata={'present' if has_enc_meta else 'MISSING'}. On-chain "
+            "access conditions were built for this IP-NFT (a confidential upload), so it "
+            "must be finalized with a non-PUBLIC accessLevel AND encryptionMetadata. Do "
+            "NOT fall back to the public path — abort and report the failure."
+        )
+
+
+# --------------------------------------------------------------------------
 # Labs GraphQL (direct)
 # --------------------------------------------------------------------------
 
 LabsAuth = Literal["service-token", "api-key", "none"]
 
 
-def _labs_headers(auth: LabsAuth) -> dict[str, str]:
+def _labs_headers(
+    auth: LabsAuth,
+    service_token: str | None = None,
+    wallet_address: str | None = None,
+) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if auth == "service-token":
-        creds = require_env("MOLECULE_SERVICE_TOKEN", "EVM_WALLET_ADDRESS")
-        headers["x-service-token"] = creds["MOLECULE_SERVICE_TOKEN"]
-        headers["x-wallet-address"] = creds["EVM_WALLET_ADDRESS"]
+        # Per-call overrides let the agent act as any authorized wallet (e.g.
+        # decrypt as the OWNER wallet) without swapping env / reloading.
+        token = service_token or env("MOLECULE_SERVICE_TOKEN")
+        addr = wallet_address or env("EVM_WALLET_ADDRESS")
+        if not token or not addr:
+            raise ToolError(
+                "service-token auth needs MOLECULE_SERVICE_TOKEN + EVM_WALLET_ADDRESS "
+                "(or serviceToken / walletAddress overrides)."
+            )
+        headers["x-service-token"] = token
+        headers["x-wallet-address"] = addr
     elif auth == "api-key":
         creds = require_env("MOLECULE_API_KEY")
         headers["x-api-key"] = creds["MOLECULE_API_KEY"]
@@ -233,13 +338,15 @@ def labs_graphql_call(
     variables: dict[str, Any],
     auth: LabsAuth,
     labs_url: str | None = None,
+    service_token: str | None = None,
+    wallet_address: str | None = None,
 ) -> dict[str, Any]:
     url = labs_url or env("MOLECULE_LABS_URL")
     if not url:
         raise ToolError("MOLECULE_LABS_URL is not set (and no labsUrl override given).")
     resp = _client.post(
         url,
-        headers=_labs_headers(auth),
+        headers=_labs_headers(auth, service_token, wallet_address),
         content=json.dumps({"query": query, "variables": variables}),
     )
     j = _json_or_none(resp)
@@ -294,6 +401,10 @@ def run_x402_pay(
     gateway_url: str | None,
     wallet_id: str | None,
 ) -> dict[str, Any]:
+    # Fail-closed: never let a confidential IP-NFT be finalized as a public /
+    # plaintext file, even if the agent reaches this with the wrong variables.
+    if mutation == "finishCreateOrUpdateFileV2":
+        assert_confidential_finalize_ok(variables)
     gateway = gateway_url or env("X402_GATEWAY_URL")
     if not gateway:
         raise ToolError("X402_GATEWAY_URL is not set.")
@@ -328,8 +439,23 @@ def run_x402_pay(
     if not amount or not asset or not pay_to:
         raise ToolError(f'x402 challenge for "{mutation}" is missing amount/asset/payTo.')
 
-    # P3 — wallet address.
+    # P3 — wallet address. EIP-3009 requires the authorization `from` to be the
+    # address whose key signs. Privy always signs with the wallet's own key, so a
+    # stale EVM_WALLET_ADDRESS that differs from the Privy wallet produces a
+    # signature the facilitator recovers to a different signer and rejects with a
+    # generic "Payment verification failed". Catch that here with a clear message.
     wallet_address = get_wallet_address(wid)
+    _auth, _phdr = _privy_auth()
+    _wj = _json_or_none(_client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=_auth, headers=_phdr))
+    signer_address = (_wj or {}).get("address")
+    if signer_address and wallet_address.lower() != signer_address.lower():
+        raise ToolError(
+            f"x402 payment would be rejected: the EIP-3009 `from` ({wallet_address}) "
+            f"does not match the Privy signing wallet {wid} ({signer_address}). The "
+            f"facilitator recovers the signer from the signature and fails verification "
+            f"when signer != from. Set EVM_WALLET_ADDRESS to {signer_address}, or point "
+            f"PRIVY_WALLET_ID at the {wallet_address} wallet."
+        )
 
     # P4 — nonce, validAfter, validBefore.
     now = int(time.time())
@@ -339,8 +465,10 @@ def run_x402_pay(
     chain_id = _chain_id_from_network(network)
 
     # P5 — EIP-712 TransferWithAuthorization signed by the Privy wallet.
-    # NOTE: the EIP-712 object uses the standard camelCase `primaryType`
-    # (Privy's `typed_data` wrapper is snake_case; the object inside is not).
+    # NOTE: Privy's wallet-RPC typed_data schema is snake_case all the way down —
+    # the primary type field is `primary_type`, not the EIP-712 `primaryType`
+    # (see EthereumSignTypedDataRpcInput.Params.TypedData in @privy-io/node). The
+    # API rejects camelCase `primaryType` with a 400.
     typed_data = {
         "types": {
             "EIP712Domain": [
@@ -358,7 +486,7 @@ def run_x402_pay(
                 {"name": "nonce", "type": "bytes32"},
             ],
         },
-        "primaryType": "TransferWithAuthorization",
+        "primary_type": "TransferWithAuthorization",
         "domain": {
             "name": extra.get("name"),
             "version": extra.get("version"),
@@ -565,7 +693,7 @@ def abi_encode_impl(function_signature: str, args: list[Any]) -> str:
 def privy_get_wallet_address(walletId: str | None = None) -> str:
     """Resolve the agent wallet address. Returns $EVM_WALLET_ADDRESS if set,
     otherwise looks up the Privy server wallet by id. Replaces aura's
-    get_wallet_address and molecule-x402's 'resolve the wallet address' curl."""
+    get_wallet_address / 'resolve the wallet address' curl."""
     address = get_wallet_address(walletId)
     return dump({"address": address, "walletId": walletId or env("PRIVY_WALLET_ID")})
 
@@ -662,6 +790,11 @@ def privy_sign_typed_data(typedData: dict, walletId: str | None = None) -> str:
     it as params.typed_data). x402_pay does this internally; use this only for
     ad-hoc signing. Returns {signature}."""
     wid = resolve_wallet_id(walletId)
+    # Privy's wallet-RPC typed_data schema uses snake_case `primary_type`; accept
+    # the standard EIP-712 camelCase `primaryType` from callers and remap it.
+    if isinstance(typedData, dict) and "primaryType" in typedData and "primary_type" not in typedData:
+        typedData = {**typedData, "primary_type": typedData["primaryType"]}
+        typedData.pop("primaryType", None)
     res = privy_rpc(wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typedData}})
     signature = (res or {}).get("data", {}).get("signature")
     if not signature:
@@ -689,7 +822,10 @@ def privy_send_transaction(
     if data:
         transaction["data"] = data
     if value:
-        transaction["value"] = value
+        # Privy's transaction.value must be hex-encoded wei ("0x…"); the tool's
+        # documented input is decimal wei, so convert (and pass hex through).
+        v = str(value).strip()
+        transaction["value"] = v if v.startswith("0x") else hex(int(v))
     res = privy_rpc(
         wid,
         {"method": "eth_sendTransaction", "caip2": f"eip155:{cid}", "params": {"transaction": transaction}},
@@ -748,9 +884,13 @@ def labs_graphql(
     """POST a GraphQL query/mutation to $MOLECULE_LABS_URL. auth='api-key' sends
     x-api-key:$MOLECULE_API_KEY (aura mint flow). auth='service-token' sends
     x-service-token:$MOLECULE_SERVICE_TOKEN + x-wallet-address:$EVM_WALLET_ADDRESS
-    (molecule-x402). auth='none' for public sign-in queries. Returns {data, errors}.
+    (private/encrypted upload). auth='none' for public sign-in queries. Returns {data, errors}.
     Do NOT use for generateDataEncryptionKey/decryptDataKey — use
     labs_generate_dek/labs_decrypt_dek so the plaintext DEK stays inside the server."""
+    # Same fail-closed finalize guard as x402_pay, in case the finalize is ever
+    # routed through the direct Labs endpoint instead of the x402 gateway.
+    if "finishCreateOrUpdateFileV2" in query:
+        assert_confidential_finalize_ok(variables)
     return dump(labs_graphql_call(query, variables or {}, auth, labsUrl))
 
 
@@ -788,6 +928,7 @@ def s3_upload(
     cover image, public file upload (Step B), and the encrypted ciphertext (E3).
     Returns {status, ok}."""
     data = Path(filePath).read_bytes()
+    assert_not_confidential_plaintext(filePath, data)
     all_headers = {"Content-Type": contentType, **(headers or {})}
     resp = _client.request(method.upper(), uploadUrl, headers=all_headers, content=data)
     if resp.status_code >= 400:
@@ -851,6 +992,8 @@ def labs_decrypt_dek(
     gatewayUrl: str | None = None,
     labsUrl: str | None = None,
     walletId: str | None = None,
+    serviceToken: str | None = None,
+    walletAddress: str | None = None,
 ) -> str:
     """Call decryptDataKey (the backend evaluates on-chain access conditions for
     the caller) and KEEP the plaintext DEK inside this server. Returns
@@ -890,7 +1033,10 @@ def labs_decrypt_dek(
         r = run_x402_pay("decryptDataKey", query, variables, gatewayUrl, walletId)
         result = (r.get("data") or {}).get("decryptDataKey")
     else:
-        r = labs_graphql_call(query, variables, auth, labsUrl)
+        r = labs_graphql_call(
+            query, variables, auth, labsUrl,
+            service_token=serviceToken, wallet_address=walletAddress,
+        )
         result = (r.get("data") or {}).get("decryptDataKey")
     if not result or not result.get("isSuccess") or not result.get("plaintextDEK"):
         # Surface backend status verbatim (ACCESS_DENIED / LEGACY_ENCRYPTION).
@@ -915,7 +1061,11 @@ def encrypt_file(filePath: str, dekHandle: str, outPath: str) -> str:
     Pass dekHandle from labs_generate_dek (the plaintext DEK never enters the
     conversation). Writes ciphertext to outPath. Returns
     {iv (base64), contentHash (hex SHA-256 of plaintext), cipherBytes}."""
-    return dump(encrypt_file_impl(filePath, get_dek(dekHandle), outPath))
+    result = encrypt_file_impl(filePath, get_dek(dekHandle), outPath)
+    # Arm the fail-closed latch: this file is now confidential, so its plaintext
+    # can never be S3-uploaded by this process (no public-upload fallback).
+    mark_confidential_plaintext(filePath, result["contentHash"])
+    return dump(result)
 
 
 @mcp.tool()
@@ -983,6 +1133,9 @@ def build_access_conditions(
         raise ToolError("chainId not given and CHAIN_ID is not set.")
     ch = chain or _chain_for_caip_chain_id(cid)
     conditions = _ipnft_signer_condition(reservationId, ch, resolver)
+    # Arm the fail-closed latch: this IP-NFT is now confidential, so it can never
+    # be finalized PUBLIC / without encryptionMetadata by this process.
+    mark_confidential_token_id(reservationId)
     return dump({"conditions": conditions, "json": json.dumps(conditions, separators=(",", ":"))})
 
 
@@ -990,17 +1143,18 @@ def build_access_conditions(
 
 
 @mcp.tool()
-def mint_service_token(
+def issue_service_token(
     serviceName: str = "data-sync-service",
     expiresIn: str = "720h",
     walletAddress: str | None = None,
     walletId: str | None = None,
     labsUrl: str | None = None,
 ) -> str:
-    """One-time bootstrap: getServiceSignInMessage -> personal_sign (Privy) ->
-    generateServiceToken. Returns {token, tokenId, expiresAt} — set token as
-    MOLECULE_SERVICE_TOKEN in settings.local.json. The token is a secret; this server
-    never logs it. Prefer pre-setting MOLECULE_SERVICE_TOKEN over minting per run."""
+    """Issue a Labs JWT service token (off-chain credential — NOT an on-chain mint):
+    getServiceSignInMessage -> personal_sign (Privy) -> generateServiceToken. Returns
+    {token, tokenId, expiresAt} — set token as MOLECULE_SERVICE_TOKEN in
+    settings.local.json. The token is a secret; this server never logs it. Prefer
+    pre-setting MOLECULE_SERVICE_TOKEN over issuing per run."""
     addr = walletAddress or get_wallet_address(walletId)
     msg = labs_graphql_call(
         "query GetServiceSignInMessage($walletAddress: String!, $serviceName: String!) "
@@ -1029,6 +1183,55 @@ def mint_service_token(
     if not result or not result.get("isSuccess") or not result.get("token"):
         raise ToolError(f"generateServiceToken failed: {json.dumps(result or tok.get('errors'))[:300]}")
     return dump({"token": result.get("token"), "tokenId": result.get("tokenId"), "expiresAt": result.get("expiresAt")})
+
+
+@mcp.tool()
+def issue_owner_service_token(
+    ownerPrivateKey: str | None = None,
+    serviceName: str = "owner-data-access",
+    expiresIn: str = "720h",
+    labsUrl: str | None = None,
+) -> str:
+    """Issue a Labs JWT service token (off-chain credential — NOT an on-chain mint)
+    bound to the OWNER (user's personal) wallet by signing getServiceSignInMessage
+    with the owner's raw private key (WALLET_PRIVATE_KEY by default). Unlike
+    issue_service_token (which signs via the Privy AGENT wallet), this binds the
+    token to the owner EOA — required because
+    decryptDataKey gates on the service token's adminAddress. Pass the returned
+    `token` to labs_decrypt_dek(serviceToken=...) to decrypt as the owner. Returns
+    {token, tokenId, address, expiresAt}. The private key never leaves this process."""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except ImportError as e:  # pragma: no cover
+        raise ToolError(f"eth-account is required for owner-key signing: {e}")
+    pk = ownerPrivateKey or env("WALLET_PRIVATE_KEY")
+    if not pk:
+        raise ToolError("Provide ownerPrivateKey or set WALLET_PRIVATE_KEY.")
+    acct = Account.from_key(pk)
+    msg_q = ("query GetServiceSignInMessage($w: String!, $s: String!) { "
+             "getServiceSignInMessage(walletAddress: $w, serviceName: $s) { message } }")
+    m = labs_graphql_call(msg_q, {"w": acct.address, "s": serviceName}, "api-key", labsUrl)
+    message = (((m.get("data") or {}).get("getServiceSignInMessage")) or {}).get("message")
+    if not message:
+        raise ToolError(f"getServiceSignInMessage failed: {json.dumps(m.get('errors') or m)[:300]}")
+    signature = Account.sign_message(encode_defunct(text=message), pk).signature.hex()
+    signature = signature if signature.startswith("0x") else "0x" + signature
+    tok_q = ("mutation GenerateServiceToken($s: String!, $e: String, $w: String, $m: String) { "
+             "generateServiceToken(serviceName: $s, expiresIn: $e, walletAddress: $w, messageSignature: $m) "
+             "{ token tokenId expiresAt isSuccess message } }")
+    t = labs_graphql_call(
+        tok_q, {"s": serviceName, "e": expiresIn, "w": acct.address, "m": signature}, "api-key", labsUrl
+    )
+    res = ((t.get("data") or {}).get("generateServiceToken")) or {}
+    if not res.get("isSuccess") or not res.get("token"):
+        raise ToolError(f"generateServiceToken failed: {json.dumps(res or t.get('errors'))[:400]}")
+    return dump({
+        "token": res.get("token"),
+        "tokenId": res.get("tokenId"),
+        "address": acct.address,
+        "expiresAt": res.get("expiresAt"),
+    })
 
 
 # --------------------------------------------------------------------------
