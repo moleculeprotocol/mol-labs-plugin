@@ -25,7 +25,7 @@ Complete DeSci molecule executed as one continuous sequence of tool calls.
 Do NOT stop, report progress, or output text between steps — execute ALL steps as one uninterrupted flow.
 
 Every network, on-chain, and crypto operation runs through the **`molecule` MCP server**
-(`skills/molecule-mcp/`). The only non-MCP tools used are `read_file` (PDF text extraction),
+(`mcp/`). The only non-MCP tools used are `read_file` (PDF text extraction),
 `shared_cache` (cross-step state), and `Bash` (waits/timestamps only — never curl).
 
 **SUPER IMPORTANT RULES:**

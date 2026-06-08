@@ -25,7 +25,7 @@ Pick whichever runner your harness can spawn. All three run the same `server.py`
 ### Option A — venv (most portable; only needs `python3`)
 
 ```bash
-cd skills/molecule-mcp
+cd mcp
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
@@ -36,8 +36,8 @@ Register the venv's interpreter (absolute paths, no PATH/shell dependency at spa
 {
   "mcpServers": {
     "molecule": {
-      "command": "/abs/path/to/skills/molecule-mcp/.venv/bin/python",
-      "args": ["/abs/path/to/skills/molecule-mcp/server.py"]
+      "command": "/abs/path/to/molecule-plugin/mcp/.venv/bin/python",
+      "args": ["/abs/path/to/molecule-plugin/mcp/server.py"]
     }
   }
 }
@@ -50,7 +50,7 @@ Register the venv's interpreter (absolute paths, no PATH/shell dependency at spa
   "mcpServers": {
     "molecule": {
       "command": "uv",
-      "args": ["run", "/abs/path/to/skills/molecule-mcp/server.py"]
+      "args": ["run", "/abs/path/to/molecule-plugin/mcp/server.py"]
     }
   }
 }
