@@ -76,7 +76,7 @@ MCP server directly and point Codex at the skills:
 ```toml
 [mcp_servers.molecule]
 command = "uv"
-args = ["run", "/abs/path/to/molecule-plugin/mcp/server.py"]
+args = ["run", "/Users/vladimirdemidov/development/molecule/molecule/molecule_core/molecule-plugin/mcp/server.py"]
 
 [mcp_servers.molecule.env]
 MOLECULE_LABS_URL = "https://migration.graphql.api.molecule.xyz/graphql"
