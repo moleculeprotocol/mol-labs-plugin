@@ -61,22 +61,25 @@ edit only — never modify the skill body for environment changes.
 
 - A research PDF file in the workspace (e.g. `.tengu-attachments/document.pdf`)
 - An optional cover image (PNG/JPG) in `.tengu-attachments/`
-- Title, description, symbol, lead name, lead email, topic — draft these from the research document (surface them so the user can override).
+- Title, description, symbol, topic — draft these from the research document (surface them so the user can override).
+- **Research lead (name + email)** — REQUIRED and **user-supplied**. Do **NOT** draft, guess, or infer the research lead from the document text, author list, or cover image. You **MUST ask the user to paste the research lead's name and email up front** (see *Collect run inputs* below); if the document happens to name an author you may offer it as a pre-filled suggestion, but the user must confirm or replace it — never use an un-confirmed value.
 - **Organization** and **experiment / funding cost** — REQUIRED, run-specific, and **NOT derivable from the document and NOT static config**. You **MUST ask the user for both up front** (see *Collect run inputs* below). Never guess `organization` from the document text or the cover-image label, and never silently use the `EXPERIMENT_COST_CENTS` env var as the cost.
-- **Upload visibility** — the one knob that changes Phase 4. Pick ONE:
-  1. **Public file upload** (default) — the file is stored as plaintext with `accessLevel: PUBLIC`. Run Phase 4 Steps A–C.
+- **Upload visibility** — REQUIRED and **user-supplied**; it is the one knob that changes Phase 4, so you **MUST ask the user up front** (see *Collect run inputs* below) rather than silently assuming. Pick ONE:
+  1. **Public file upload** — the file is stored as plaintext with `accessLevel: PUBLIC`. Run Phase 4 Steps A–C.
   2. **Private file upload** (confidential / encrypted) — the file is AES-256-GCM envelope-encrypted client-side, stored as ciphertext with a non-PUBLIC `accessLevel` and on-chain access conditions. Run Phase 4 Private variant Steps E0–E6 **instead of** A–C. This path additionally needs `MOLECULE_SERVICE_TOKEN` (see below).
 
-  Everything else (Phases 0–3, 5, 6) is identical for both options, and **x402 payment is used for both** (`initiateCreateOrUpdateFileV2` / `finishCreateOrUpdateFileV2` are paid per call regardless of visibility). If the caller does not specify, default to **public**.
+  Everything else (Phases 0–3, 5, 6) is identical for both options, and **x402 payment is used for both** (`initiateCreateOrUpdateFileV2` / `finishCreateOrUpdateFileV2` are paid per call regardless of visibility). Present **public** as the pre-selected default in the question, but only proceed once the user has confirmed the choice — do not skip the ask.
 
 ## Collect run inputs (do this BEFORE the uninterrupted flow)
 
-The "do not stop or report between steps" rule governs the **execution** flow (Phases 0–6). Gathering inputs happens *first*, before that flow begins — it is not an interruption. Before Phase 1, ask the user — in a single prompt (e.g. `AskUserQuestion` in Claude Code, or the equivalent in your harness) — for the two values that are neither derivable nor static:
+The "do not stop or report between steps" rule governs the **execution** flow (Phases 0–6). Gathering inputs happens *first*, before that flow begins — it is not an interruption. Before Phase 1, ask the user — in a single prompt (e.g. `AskUserQuestion` in Claude Code, or the equivalent in your harness) — for the values that are neither derivable nor static. **Never hallucinate or silently default any of these** — each must come from the user:
 
-1. **Organization** — the organization / lab name recorded on the IP-NFT (the `organization` field in Phase 2 Steps 2 & 5). There is **no default**; if the user is unsure, have them confirm an explicit value rather than inventing one from the document or cover image.
-2. **Experiment / funding cost (USD)** — the funding amount in US dollars (e.g. `5000` → $5,000.00). Convert to integer cents for `funding_amount.value`: `experiment_cost_cents = round(USD × 100)`, kept with `"decimals": 2` (so $0.01 → `1`, $5,000 → `500000`). Only fall back to the `EXPERIMENT_COST_CENTS` env var when the run is fully non-interactive; in an interactive session always use the user's answer.
+1. **Research lead — name + email** — the person recorded as `research_lead` on the IP-NFT (Phase 2 Steps 2 & 5). This is **user-supplied; do NOT invent it from the document, author list, or cover image**. Ask the user to paste the lead's name and email. If the document plausibly names an author you MAY pre-fill it as a suggestion, but require the user to confirm or replace it before using it.
+2. **Upload visibility — public or private/encrypted** — the Phase 4 path selector. Ask explicitly; present **public** as the pre-selected default but require the user to confirm. `public` → Phase 4 Steps A–C; `private/encrypted` → Phase 4 Private variant Steps E0–E6 (also needs `MOLECULE_SERVICE_TOKEN`).
+3. **Organization** — the organization / lab name recorded on the IP-NFT (the `organization` field in Phase 2 Steps 2 & 5). There is **no default**; if the user is unsure, have them confirm an explicit value rather than inventing one from the document or cover image.
+4. **Experiment / funding cost (USD)** — the funding amount in US dollars (e.g. `5000` → $5,000.00). Convert to integer cents for `funding_amount.value`: `experiment_cost_cents = round(USD × 100)`, kept with `"decimals": 2` (so $0.01 → `1`, $5,000 → `500000`). Only fall back to the `EXPERIMENT_COST_CENTS` env var when the run is fully non-interactive; in an interactive session always use the user's answer.
 
-You MAY confirm the auto-drafted title, symbol, lead name/email, and topic in the same prompt. Once these inputs are gathered, run Phases 0–6 as one uninterrupted sequence. Use the collected organization and `experiment_cost_cents` wherever Phase 2 references `<organization>` and the funding amount.
+You MAY confirm the auto-drafted title, symbol, and topic in the same prompt. Once these inputs are gathered, run Phases 0–6 as one uninterrupted sequence. Use the collected research lead, organization, and `experiment_cost_cents` wherever Phase 2 references `research_lead`, `<organization>`, and the funding amount, and the collected visibility to choose the Phase 4 path.
 
 ## Phase 0: Wallet Setup
 
