@@ -41,7 +41,7 @@ Every network, on-chain, and crypto operation runs through the **`molecule` MCP 
 - AES-256-GCM encrypt/decrypt is handled by `mcp__molecule__encrypt_file`/`decrypt_file` (it replicates the Labs Web Crypto `encryptFileWithKms`). PDF reading still uses `read_file` — never python/pip/pdftotext.
 - Phases executed sequentially without stopping or reporting intermediate progress.
 
-## Required Environment Variables — if any is missing the relevant MCP tool terminates with an error naming it. These are needed for wallet management, authentication, and NFT transfer.
+## Environment Variables — most are required for wallet management, authentication, and NFT transfer; rows marked **Optional** are not. A required var, if missing, makes the relevant MCP tool terminate with an error naming it. **`WALLET_PRIVATE_KEY` is NOT required for the default flow** — the operating wallet is a Privy agentic wallet, so the skill issues its own service token via `mcp__molecule__issue_service_token` (no raw key). You only need `WALLET_PRIVATE_KEY` if the operating/owner wallet is a raw EOA signing through `mcp__molecule__issue_owner_service_token`.
 
 | Variable | Description |
 |----------|-------------|
@@ -49,7 +49,8 @@ Every network, on-chain, and crypto operation runs through the **`molecule` MCP 
 | `PRIVY_APP_SECRET` | Privy secret key — basic-auth password for the Privy wallet RPC |
 | `PRIVY_WALLET_ID` | Privy wallet ID (auto-detected or set after wallet creation) |
 | `EVM_WALLET_ADDRESS` | Owner's personal wallet address for NFT transfer (optional — skip transfer if not set) |
-| `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** JWT service token for the direct (non-x402) DEK generate/decrypt calls (`x-service-token`). Not needed for public uploads. If missing/expired when running the Private variant, issue one with `mcp__molecule__issue_service_token` (see Phase 4 Private variant). Secret — keep in `settings.local.json`. |
+| `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** Off-chain JWT for the direct (non-x402) DEK generate/decrypt calls (`x-service-token`), bound to one wallet's address as its `adminAddress`. Not needed for public uploads. If missing/expired, issue one **bound to the operating wallet** — `mcp__molecule__issue_service_token` (Privy agentic wallet) or `mcp__molecule__issue_owner_service_token` (EOA) — see **Service Token** below. Secret — keep in `settings.local.json`. |
+| `WALLET_PRIVATE_KEY` | **Optional — EOA service tokens only.** Raw private key of the user's EOA, used by `mcp__molecule__issue_owner_service_token` to sign the sign-in message locally and bind a service token to that EOA. Only needed when the operating/owner wallet is a plain EOA rather than a Privy agentic wallet. Secret — keep in `settings.local.json`; the key never leaves the MCP process. |
 
 **Note:** The MCP server reads all URLs, contract addresses, API keys, and secrets from the environment
 (`.claude/settings.json` for non-secrets, `.claude/settings.local.json` for secrets), which Claude Code
@@ -404,6 +405,56 @@ a real business error — surface it.
 
 ---
 
+## Service Token (off-chain JWT — bind it to the operating wallet, Privy *or* EOA)
+
+`MOLECULE_SERVICE_TOKEN` is an **off-chain JWT** (issued by Labs `generateServiceToken`; *never* minted
+on-chain). It authenticates the **direct, non-x402** DEK calls — `labs_generate_dek` / `labs_decrypt_dek`
+with `transport: direct`, `auth: service-token` — via the `x-service-token` header. **It is used only by
+the Phase 4 Private / Encrypted variant and Phase 6 owner-decrypt; public uploads never touch it.**
+
+**What the token is bound to (why the wallet matters).** The JWT payload carries an `adminAddress` — the
+single wallet the token represents (`token-manager-service.ts` `generateServiceToken`). On `decryptDataKey`
+the backend substitutes that `adminAddress` for the `:userAddress` placeholder in the on-chain access
+condition `isAuthorizedSignerForIpnft(:userAddress, <reservationId>)` (see Phase 4 Step E6). So a service
+token only unlocks a file if **the wallet it is bound to owns — or is a recursive Safe / Ownable /
+ERC-6551 signer of — that IP-NFT.** Bind the token to whichever wallet is the IP-NFT's authorized signer
+at the moment of the call; a token bound to the wrong wallet authenticates fine but fails `ACCESS_DENIED`
+on decrypt.
+
+**How issuance works (identical for both wallet types — no x402, no on-chain tx).** The MCP runs the same
+three off-chain steps under the hood:
+1. `getServiceSignInMessage(walletAddress, serviceName)` → a fixed sign-in message naming the wallet + service.
+2. That wallet **signs the exact message** (EIP-191 `personal_sign`).
+3. `generateServiceToken(serviceName, expiresIn, walletAddress, messageSignature)` → the backend recomputes
+   the message, `verifyMessage`s the signature against `walletAddress`, and on success sets
+   `adminAddress = walletAddress`. Returns `{ token, tokenId, expiresAt }`.
+
+Because step 2 is a standard ECDSA message signature, **a Privy agentic (embedded) wallet and a raw EOA are
+interchangeable to the backend** — the only difference is *which key signs*. The MCP exposes one tool per
+signer:
+
+| Operating wallet | Tool | Signs step 2 with | Binds token to | Needs |
+|---|---|---|---|---|
+| **Privy agentic wallet** | `mcp__molecule__issue_service_token` | Privy `personal_sign` (RPC) | the Privy wallet (`get_wallet_address`; pass `walletId`/`walletAddress` to target a non-default one) | `PRIVY_APP_ID`, `PRIVY_APP_SECRET`, `PRIVY_WALLET_ID` — **no** Privy login/session |
+| **EOA (raw key)** | `mcp__molecule__issue_owner_service_token` | local `eth_account` sign with `WALLET_PRIVATE_KEY` | the EOA (`ownerPrivateKey` → its address) | `WALLET_PRIVATE_KEY` (or `ownerPrivateKey` arg) — the key never leaves the MCP |
+
+Both return `{ token, ... }`. Set the returned `token` as `MOLECULE_SERVICE_TOKEN` in
+`.claude/settings.local.json` (it is a secret — the MCP never logs it, and neither should you), or pass it
+per-call via the `serviceToken` override on `labs_generate_dek` / `labs_decrypt_dek` when you need a token
+bound to a *different* wallet than the env default.
+
+**Selection rule (apply this everywhere a service token is needed):**
+1. Identify the wallet that must be the IP-NFT's authorized signer for this call (the minter/owner, or a
+   recursive Safe/Ownable/TBA signer of it).
+2. **Privy agentic wallet → `issue_service_token`** (pass its `walletId`/`walletAddress` if it isn't the
+   default `PRIVY_WALLET_ID`).
+3. **Plain EOA → `issue_owner_service_token`** (pass its key via `ownerPrivateKey`, or set
+   `WALLET_PRIVATE_KEY`).
+4. Prefer a pre-set `MOLECULE_SERVICE_TOKEN` already bound to the right wallet over issuing per run; only
+   issue when it is missing/expired, or when you need a token bound to a different wallet than the env one.
+
+---
+
 ## Phase 3: Create Molecule Project (via x402)
 
 **Wait 90 seconds** after minting — on-chain ownership needs time to propagate to the AccessResolver:
@@ -472,16 +523,16 @@ mcp__molecule__s3_upload:
 
 ### Step C — Finalize upload (x402 paid)
 
-**Categories and tags** (REQUIRED — pick exactly one category and one or more correlated tags from the lists below; do NOT invent values):
+**Categories and tags** (REQUIRED — pick exactly one category and one or more correlated tags from the lists below; do NOT invent values). **Casing matters:** send the **category in lowercase** and each **tag in Title-Case** (e.g. `science` + `Discovery`). A wrong-cased finalize is rejected by the backend *after* the x402 payment has already settled, so a casing mistake makes you pay 2–3× for one upload — get it right on the first call.
 
-Allowed categories:
+Allowed categories (send lowercase):
 ```
-['Science', 'Business', 'Governance', 'Media']
+['science', 'business', 'governance', 'media']
 ```
 
 Correlated tags (each tag belongs to exactly one category — only pick tags whose category matches the chosen category):
 ```
-Business:
+business:
   'Ecosystem Partnership',
   'Funding',
   'University Partnership',
@@ -489,17 +540,17 @@ Business:
   'Market Opportunity',
   'Regulatory filing',
   'Biotech Partnership'
-Governance:
+governance:
   'Proposal Failed',
   'Proposal Approved',
   'Proposal Open for Feedback'
-Media:
+media:
   'Promotional material',
   'Blog',
   'News coverage',
   'Academic article',
   'Pitch deck'
-Science:
+science:
   'Discovery',
   'Clinical Trial',
   'Provisional Patent Application',
@@ -514,13 +565,13 @@ Science:
   'Patent granted'
 ```
 
-Derive the category and tags from the research document content. For a typical research-PDF upload, default to category `Science` with tag(s) like `Discovery` or `Validation` unless the document clearly fits another category.
+Derive the category and tags from the research document content. For a typical research-PDF upload, default to category `science` (lowercase) with tag(s) like `Discovery` or `Validation` unless the document clearly fits another category.
 
 ```
 mcp__molecule__x402_pay:
   mutation: finishCreateOrUpdateFileV2
   query: "mutation FinishCreateOrUpdateFileV2($ipnftUid: String!, $uploadToken: String!, $path: String, $accessLevel: String!, $changeBy: String!, $description: String, $tags: [String!], $categories: [String!]) { finishCreateOrUpdateFileV2(ipnftUid: $ipnftUid, uploadToken: $uploadToken, path: $path, accessLevel: $accessLevel, changeBy: $changeBy, description: $description, tags: $tags, categories: $categories) { datasetId contentHash version newHead isSuccess message error { message code retryable } } }"
-  variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from step A>", "path": "<filename>", "accessLevel": "PUBLIC", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: Science | Business | Governance | Media>"], "tags": ["<one or more correlated tags from the list above>"] }
+  variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from step A>", "path": "<filename>", "accessLevel": "PUBLIC", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: science | business | governance | media>"], "tags": ["<one or more correlated tags from the list above>"] }
 ```
 
 From `data.finishCreateOrUpdateFileV2` extract: `datasetId` (format: `did:odf:...`), `contentHash`. Cache:
@@ -535,13 +586,20 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "dataset_id"
 Use this **instead of** Steps A–C when the file must be confidential. It is a faithful client-side replication of Labs **Onchain-Verified Envelope Encryption** (`encryptFileWithKms`) — same algorithm, IV size, tag handling, and `contentHash` rule (handled by `mcp__molecule__encrypt_file`). The backend never sees plaintext or the unwrapped key; it only stores the ciphertext, the KMS-wrapped DEK, and the on-chain access conditions.
 
 **Preconditions & invariants:**
-- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + `EVM_WALLET_ADDRESS`). `generateDataEncryptionKey` is now x402-whitelisted (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), but keep it **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch. If the service token is missing/expired, the call returns an auth error — issue a fresh one and retry:
-  ```
-  mcp__molecule__issue_service_token:
-    serviceName: data-sync-service
-    expiresIn: "720h"
-  ```
-  Set the returned `token` — an **off-chain JWT** (issued by `generateServiceToken` after a wallet signature; *not* an on-chain mint) — as `MOLECULE_SERVICE_TOKEN` in `.claude/settings.local.json` (the tool runs `getServiceSignInMessage` → `personal_sign` via the Privy wallet → `generateServiceToken`; no Privy session needed). The token is a secret — the MCP never logs it, and neither should you.
+- The DEK is generated by `mcp__molecule__labs_generate_dek` with **`transport: direct`** + `auth: service-token` (needs `MOLECULE_SERVICE_TOKEN` + the operating wallet's address). `generateDataEncryptionKey` is now x402-whitelisted (`desci-infra/lambda/x402-gateway-lambda/mutations.ts`), but keep it **direct** so the plaintext DEK stays in-process and no payment is spent on a key fetch. The service token here must be **bound to the operating wallet** — the wallet that minted and (until any Phase 6 transfer) owns this IP-NFT, i.e. its authorized signer. If it is missing/expired, issue a fresh one bound to that wallet — pick the tool by the operating wallet's type (full rule in **Service Token** above):
+  - **Privy agentic operating wallet** (the default in this skill — Phase 0/2 mint via Privy):
+    ```
+    mcp__molecule__issue_service_token:
+      serviceName: data-sync-service
+      expiresIn: "720h"
+    ```
+  - **EOA operating wallet** (when the minter/owner is a raw key, not Privy — needs `WALLET_PRIVATE_KEY`):
+    ```
+    mcp__molecule__issue_owner_service_token:
+      serviceName: data-sync-service
+      expiresIn: "720h"
+    ```
+  Set the returned `token` as `MOLECULE_SERVICE_TOKEN` in `.claude/settings.local.json`. Both tools run the same off-chain `getServiceSignInMessage` → message-sign → `generateServiceToken` flow (no Privy login, no on-chain mint, no x402) and differ only in which wallet signs — so the DEK flow is identical whether the operating wallet is Privy or an EOA. The token is a secret — the MCP never logs it, and neither should you.
 - `accessLevel` MUST be `ADMIN` (or `HOLDERS`) — valid values are `PUBLIC | HOLDERS | ADMIN`. Never `PUBLIC` for a confidential file.
 - **Production guard:** the backend verifies the caller is an authorized signer for the IP-NFT (`isAuthorizedSignerForIpnft`) on the configured `AccessResolver` chain before it will finalize an encrypted file. If the resolver is unreachable / not deployed on that chain, Step E5 fails with a clear error — surface that message verbatim and stop.
 - The plaintext DEK is **one-shot and secret** and **never leaves the MCP** — `labs_generate_dek` hands back only a `dekHandle`. Only `encryptedDek` (wrapped) and the ciphertext are persisted.
@@ -603,7 +661,7 @@ mcp__molecule__build_access_conditions:
 
 ### Step E5 — Finalize the encrypted upload (x402 paid)
 
-Same category/tag rules as the public Step C (pick exactly one category + correlated tag(s) — default `Science` / `Discovery`). The new piece is `encryptionMetadata` (`EncryptionMetadataInput`) and the non-PUBLIC `accessLevel`. `encryptionMetadata.accessControlConditions` is the E4 **`json`** string. Generate `encryptedAt` as an ISO-8601 UTC timestamp:
+Same category/tag rules as the public Step C (pick exactly one category + correlated tag(s) — lowercase category, Title-Case tag — default `science` / `Discovery`). The new piece is `encryptionMetadata` (`EncryptionMetadataInput`) and the non-PUBLIC `accessLevel`. `encryptionMetadata.accessControlConditions` is the E4 **`json`** string. Generate `encryptedAt` as an ISO-8601 UTC timestamp:
 ```
 Bash: date -u +%Y-%m-%dT%H:%M:%SZ
 ```
@@ -622,7 +680,7 @@ Bash: date -u +%Y-%m-%dT%H:%M:%SZ
 mcp__molecule__x402_pay:
   mutation: finishCreateOrUpdateFileV2
   query: "mutation FinishCreateOrUpdateFileV2($ipnftUid: String!, $uploadToken: String!, $path: String, $accessLevel: String!, $changeBy: String!, $description: String, $tags: [String!], $categories: [String!], $encryptionMetadata: EncryptionMetadataInput) { finishCreateOrUpdateFileV2(ipnftUid: $ipnftUid, uploadToken: $uploadToken, path: $path, accessLevel: $accessLevel, changeBy: $changeBy, description: $description, tags: $tags, categories: $categories, encryptionMetadata: $encryptionMetadata) { datasetId contentHash version newHead isSuccess message error { message code retryable } } }"
-  variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from E2>", "path": "<filename>", "accessLevel": "ADMIN", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: Science | Business | Governance | Media>"], "tags": ["<one or more correlated tags>"], "encryptionMetadata": { "encryptionSystem": "<from E0>", "accessControlConditions": "<E4 json string>", "encryptedBy": "<wallet_address>", "encryptedAt": "<ISO-8601 UTC>", "encryptedDek": "<from E0>", "iv": "<from E1>", "contentHash": "<from E1>" } }
+  variables: { "ipnftUid": "<ipnft_uid>", "uploadToken": "<from E2>", "path": "<filename>", "accessLevel": "ADMIN", "changeBy": "<wallet_address>", "description": "<file description>", "categories": ["<one of: science | business | governance | media>"], "tags": ["<one or more correlated tags>"], "encryptionMetadata": { "encryptionSystem": "<from E0>", "accessControlConditions": "<E4 json string>", "encryptedBy": "<wallet_address>", "encryptedAt": "<ISO-8601 UTC>", "encryptedDek": "<from E0>", "iv": "<from E1>", "contentHash": "<from E1>" } }
 ```
 
 From `data.finishCreateOrUpdateFileV2` extract `datasetId` (`did:odf:...`) and `contentHash`, then cache:
@@ -644,7 +702,7 @@ mcp__molecule__labs_decrypt_dek:
 ```
 Returns `iv` and a fresh `dekHandle` on success. A `LEGACY_ENCRYPTION` message means the file predates the envelope flow; `ACCESS_DENIED` means the decrypt caller does not satisfy the on-chain `isAuthorizedSignerForIpnft` condition.
 
-**IMPORTANT — the decrypt caller is NOT the `x-wallet-address` header.** When a service token is present (it always is here), the backend substitutes the **service token's `adminAddress`** for `:userAddress` (`appsync-resolver-labs-lambda/index.ts` `case "decryptDataKey"` → `serviceContext.adminAddress`; evaluated by `services/condition-evaluator.ts`). So to decrypt *as* a given wallet you must present a `MOLECULE_SERVICE_TOKEN` **bound to that wallet** — issue one for the Privy agent with `mcp__molecule__issue_service_token`, or for the owner EOA with `mcp__molecule__issue_owner_service_token` (signs the sign-in message with `WALLET_PRIVATE_KEY`), and pass it via the per-call `serviceToken` override:
+**IMPORTANT — the decrypt caller is NOT the `x-wallet-address` header.** When a service token is present (it always is here), the backend substitutes the **service token's `adminAddress`** for `:userAddress` (`appsync-resolver-labs-lambda/index.ts` `case "decryptDataKey"` → `serviceContext.adminAddress`; evaluated by `services/condition-evaluator.ts`). So to decrypt *as* a given wallet you must present a `MOLECULE_SERVICE_TOKEN` **bound to that wallet** — issue one for a Privy agentic wallet with `mcp__molecule__issue_service_token`, or for an EOA with `mcp__molecule__issue_owner_service_token` (signs the sign-in message with `WALLET_PRIVATE_KEY`); see **Service Token** for the wallet-type selection rule. Pass it via the per-call `serviceToken` override:
 ```
 mcp__molecule__labs_decrypt_dek:
   ipnftUid: "<ipnft_uid>"
@@ -708,8 +766,10 @@ Save `calldata`.
 
 ### Step C — Transfer IP-NFT on-chain
 
+Use **`privy_send_raw_transaction`** here, **not** `privy_send_transaction`. For `safeTransferFrom` from the agent wallet, Privy's `eth_sendTransaction` returns a hash but never broadcasts it (the "phantom hash") — even though mint and POI broadcast fine on the same wallet. `privy_send_raw_transaction` signs sign-only via Privy `eth_signTransaction` and broadcasts the raw tx itself, resolving the live `pending` nonce (so it is re-runnable after a stuck attempt). It uses `EVM_RPC_URL` (falling back to a public node for known chains); pass `rpcUrl` to override.
+
 ```
-mcp__molecule__privy_send_transaction:
+mcp__molecule__privy_send_raw_transaction:
   to: $IPNFT_CONTRACT_ADDRESS
   data: <calldata from step B>
   chainId: $CHAIN_ID
@@ -737,7 +797,12 @@ Skip for public uploads. For a **private** upload (Phase 4 Private variant), the
 - the Step C `safeTransferFrom` above — once the owner holds the IP-NFT they ARE the authorized signer (the common path); **or**
 - if the IP-NFT was not transferred to them, make the file's `encryptionMetadata.accessControlConditions` an **OR** that also authorizes the owner (Lit unified format `[cond, {"operator":"or"}, cond]`, e.g. OR a second `isAuthorizedSignerForIpnft(:userAddress, <a tokenId the owner owns>)`). The evaluator supports boolean operators but only contract-call conditions (no bare address-equality), so the owner must be an authorized signer of *some* IP-NFT.
 
-The owner then decrypts by presenting an owner-bound service token (no env swap needed) — `mcp__molecule__issue_owner_service_token: {}` then pass its `token` to `labs_decrypt_dek` via the `serviceToken` override, as in Step E6.
+The owner then decrypts by presenting a service token **bound to the owner's wallet** (no env swap needed — use the per-call `serviceToken` override on `labs_decrypt_dek`, as in Step E6). Pick the issuing tool by the owner wallet's type (see **Service Token**):
+
+- **Owner holds an EOA** → `mcp__molecule__issue_owner_service_token: {}` (signs with `WALLET_PRIVATE_KEY`).
+- **Owner holds a Privy agentic wallet** → `mcp__molecule__issue_service_token: { walletId: "<owner's Privy wallet id>" }` (omit `walletId` only if the owner wallet is the default `PRIVY_WALLET_ID`).
+
+Either way the token's `adminAddress` must be the owner's address — that is what the decrypt evaluator substitutes into `isAuthorizedSignerForIpnft`.
 
 ## Output
 

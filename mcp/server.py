@@ -837,6 +837,124 @@ def privy_send_transaction(
     return dump({"txHash": tx_hash})
 
 
+# Public fallback RPC endpoints by chain id, used by privy_send_raw_transaction
+# when neither rpcUrl nor EVM_RPC_URL is provided.
+_DEFAULT_RPC_BY_CHAIN: dict[str, str] = {
+    "11155111": "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia L1
+}
+
+
+def _chain_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
+    """Minimal JSON-RPC call against an EVM node (live nonce + raw broadcast)."""
+    resp = _client.post(
+        rpc_url,
+        headers={"content-type": "application/json"},
+        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
+    )
+    j = _json_or_none(resp)
+    if resp.status_code >= 400 or not isinstance(j, dict) or j.get("error") or "result" not in j:
+        err = j.get("error") if isinstance(j, dict) else None
+        raise ToolError(
+            f"EVM RPC {method} failed ({resp.status_code}): "
+            + (json.dumps(err) if err else resp.text[:300])
+        )
+    return j["result"]
+
+
+@mcp.tool()
+def privy_send_raw_transaction(
+    to: str,
+    data: str | None = None,
+    value: str | None = None,
+    chainId: str | None = None,
+    walletId: str | None = None,
+    rpcUrl: str | None = None,
+    gasLimit: str | None = None,
+    maxFeePerGas: str | None = None,
+    maxPriorityFeePerGas: str | None = None,
+) -> str:
+    """Sign with Privy (eth_signTransaction, SIGN-ONLY) then broadcast the raw tx
+    yourself via eth_sendRawTransaction against an EVM RPC. Use this for the IP-NFT
+    `safeTransferFrom` (Phase 6 transfer): Privy's eth_sendTransaction returns a
+    hash but never broadcasts safeTransferFrom for the agent wallet — the "phantom
+    hash" — even though mint/POI broadcast fine, so keep using privy_send_transaction
+    for those. Resolves the live `pending` nonce so the call is re-runnable. rpcUrl
+    falls back to EVM_RPC_URL, then a public node for known chains. value is decimal
+    wei (or 0x hex). Gas is auto-estimated (eth_estimateGas ×1.2) unless gasLimit is
+    passed — a flat default reverts mint out-of-gas; EIP-1559 fees default to 5/2 gwei.
+    Returns {txHash, nonce, from, gasLimit}."""
+    wid = resolve_wallet_id(walletId)
+    cid = str(chainId or env("CHAIN_ID") or "")
+    if not cid:
+        raise ToolError("chainId not provided and CHAIN_ID is not set.")
+    rpc = rpcUrl or env("EVM_RPC_URL") or _DEFAULT_RPC_BY_CHAIN.get(cid)
+    if not rpc:
+        raise ToolError(
+            f"No EVM RPC endpoint for chainId {cid}. Pass rpcUrl or set EVM_RPC_URL."
+        )
+
+    # Resolve the SENDER (signer) address from the Privy wallet record directly.
+    # Do NOT use get_wallet_address(): it prefers EVM_WALLET_ADDRESS, which in the
+    # aura flow is the transfer RECIPIENT, not the sender — that would query the
+    # wrong account's nonce.
+    auth, headers = _privy_auth()
+    wj = _json_or_none(_client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=auth, headers=headers))
+    sender = (wj or {}).get("address")
+    if not sender:
+        raise ToolError(f"Could not resolve signer address for Privy wallet {wid}.")
+
+    # Live pending nonce keeps the tool re-runnable after a stuck/failed attempt.
+    nonce = int(_chain_rpc(rpc, "eth_getTransactionCount", [sender, "pending"]), 16)
+
+    val = "0x0"
+    if value:
+        v = str(value).strip()
+        val = v if v.startswith("0x") else hex(int(v))
+
+    # Gas limit: an explicit override wins; otherwise estimate with a 20% buffer.
+    # A flat default is unsafe — a transfer is ~51k but mintReservation needs
+    # ~176k, so a fixed 100k silently reverts OUT-OF-GAS on mint. Note that an
+    # eth_call simulation can still PASS in that window (it assumes a high gas
+    # cap), so it is a misleading signal — eth_estimateGas is the real check.
+    if gasLimit:
+        gas_limit_hex = gasLimit
+    else:
+        est_call: dict[str, Any] = {"from": sender, "to": to, "value": val}
+        if data:
+            est_call["data"] = data
+        try:
+            est = int(_chain_rpc(rpc, "eth_estimateGas", [est_call]), 16)
+            gas_limit_hex = hex(est * 12 // 10)  # ×1.2 buffer
+        except ToolError:
+            gas_limit_hex = "0x61a80"  # 400000 fallback (covers mint ~176k + transfers)
+
+    transaction: dict[str, Any] = {
+        "to": to,
+        "value": val,
+        "chain_id": int(cid),
+        "nonce": nonce,
+        # EIP-1559 fee defaults from privy_transfer_v5.sh (5 gwei / 2 gwei);
+        # override per chain congestion via the params above.
+        "max_fee_per_gas": maxFeePerGas or "0x12a05f200",
+        "max_priority_fee_per_gas": maxPriorityFeePerGas or "0x77359400",
+        "gas_limit": gas_limit_hex,
+        "type": 2,
+    }
+    if data:
+        transaction["data"] = data
+
+    res = privy_rpc(
+        wid,
+        {"chain_type": "ethereum", "method": "eth_signTransaction", "params": {"transaction": transaction}},
+    )
+    signed = ((res or {}).get("data") or {}).get("signed_transaction")
+    if not signed:
+        raise ToolError(f"Privy returned no signed_transaction. Raw: {json.dumps(res)[:400]}")
+
+    tx_hash = _chain_rpc(rpc, "eth_sendRawTransaction", [signed])
+    return dump({"txHash": tx_hash, "nonce": nonce, "from": sender, "gasLimit": gas_limit_hex})
+
+
 # ---- Molecule HTTP -------------------------------------------------------
 
 
