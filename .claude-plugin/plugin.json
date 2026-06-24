@@ -1,6 +1,6 @@
 {
   "name": "molecule-desci",
-  "description": "DeSci molecule orchestration for Molecule Labs in one skill (aura-orchestrator): POI registration + IP-NFT minting + project creation + x402-paid data-room file upload (public or client-side-encrypted) + announcement + transfer, backed by the custody-free `molecule` MCP server. The MCP crafts every request/payload (x402 prepare/submit, AES-256-GCM envelope crypto, ABI encoding, on-chain access conditions) but never holds a key, signs, or broadcasts - your wallet does that (a Privy agentic wallet, recommended, or your own key). V2 GraphQL surface, keyed on ipnftUid.",
+  "description": "DeSci molecule orchestration for Molecule Labs in one skill (aura-orchestrator): POI registration + IP-NFT minting + project creation + x402-paid data-room file upload (public or client-side-encrypted) + announcement + transfer, backed by the custody-free `molecule` MCP server. V2 GraphQL surface, keyed on ipnftUid. The MCP server crafts requests and payloads (x402 prepare/submit, AES-256-GCM envelope crypto, ABI encoding, on-chain access conditions) but never holds a key, signs, or broadcasts - you bring a  wallet / on chain rpc connector that does that. However, this plugin includes the privy-agentic-wallets skill (recommended for agentic use).",
   "version": "0.3.0",
   "author": {
     "name": "Vladimir Demidov",
