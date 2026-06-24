@@ -4,24 +4,21 @@ Packages the DeSci orchestration skill (+ a wallet helper) and the `molecule` MC
 installable plugin that works under **Claude Code** and **OpenAI Codex** (and any MCP host, via the
 server alone).
 
-- **`aura-orchestrator`** — the whole molecule in one skill: POI registration → IP-NFT minting → project
+- **`aura-orchestrator`** — the whole molecule labs stack in one skill: POI registration → IP-NFT minting → project
   creation → data-room file upload → announcement → transfer. V2 surface, keyed on `ipnftUid`. The file
   upload (Phase 4) is the only branch: choose **public** (plaintext) or **private** (client-side
   AES-256-GCM envelope-encrypted, access-controlled) — **x402 pays per call either way**.
-- **`privy-agentic-wallets`** — the **recommended** way to provision the wallet that signs this molecule:
-  a policy-guarded Privy server wallet (no user interaction, ideal for autonomous agents). Optional — you
-  can bring any key you control instead — but it is the first option we recommend.
+- **`privy-agentic-wallets`** — the **recommended** way to provision wallets that help signing for the molecule stack:
+  they are policy-guarded server wallets (no user interactions needed, ideal for autonomous agents). Alternatively you
+  can bring any key and RPC server you control to sign,  submit and watch transactions.
 - **`molecule` MCP server** (`mcp/server.py`, Python/FastMCP, stdio) — **custody-free**: it *crafts* the
   requests/payloads (POI, Labs GraphQL, **x402 prepare/submit**, S3 upload, AES-256-GCM envelope crypto,
   ABI encoding, on-chain access conditions, service-token sign-in) and runs only the non-signing HTTP
-  around them. It **never holds a key, signs, or broadcasts** — **your wallet** does that.
+  around them. It **never holds a key, signs, or broadcasts** - your wallet does that.
 
-> **The MCP holds no keys.** Signing and broadcasting are the caller's job, done by your wallet — a Privy
-> agentic wallet (recommended) or any key you control. See
-> [`skills/aura-orchestrator/references/wallet-signing.md`](skills/aura-orchestrator/references/wallet-signing.md)
-> for ready-to-use signing snippets (Privy first, then viem / ethers / eth-account).
+See the [`skills/aura-orchestrator/references/wallet-signing.md`](skills/aura-orchestrator/references/wallet-signing.md) document for ready-to-use signing snippets (Privy first, then viem / ethers / eth-account).
 
-> **The MCP server is the portable core** — both harnesses speak MCP. Skills (`SKILL.md`) are a shared
+> **The MCP server is the portable core** — harnesses speak MCP. Skills (`SKILL.md`) are a shared
 > standard both now read. Only the *plugin manifest* differs per harness, so this package ships both
 > `.claude-plugin/` and `.codex-plugin/` manifests pointing at the same `skills/` and `.mcp.json`.
 
@@ -49,14 +46,14 @@ The MCP server runs via **`uv run mcp/server.py`**, which reads the PEP 723 inli
 
 ## Environment variables
 
-The server reads all config from the environment (never from tool args), and it reads **no wallet
-credentials** — it holds no private key. Non-secrets: `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
+The server reads all config from the environment (never from tool args). Non-secrets: `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
 `X402_GATEWAY_URL`, `ACCESS_RESOLVER_ADDRESS`, `IPNFT_CONTRACT_ADDRESS`, `CHAIN_ID`, `ENVIRONMENT`,
-`EVM_WALLET_ADDRESS` (your operating wallet's **public** address), `EXPERIMENT_COST_CENTS`. Secrets:
-`POI_API_KEY`, `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`. Your **wallet** credentials — a Privy
-`PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` (optional), or your own private key — belong to
-your signer setup, **NOT** to the molecule MCP; keep them wherever your wallet tooling reads them. See
-`mcp/README.md` for the per-tool breakdown.
+`EVM_WALLET_ADDRESS` (your operating wallet's **public** address), `EXPERIMENT_COST_CENTS`. 
+
+Secrets:
+`POI_API_KEY`, `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`. Either Your Privy agent wallet credentials
+`PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` or your own private key material (keep them wherever your wallet tooling reads them).
+ See [mcp/README.md](mcp/README.md) for the per-tool breakdown.
 
 ---
 
@@ -127,9 +124,8 @@ order; this is the cross-skill map.
 
 1. **Env + MCP.** Install `uv`, register the plugin (Claude) or MCP server (Codex), and set the env vars
    above. Pick the surface with `MOLECULE_LABS_URL` / `X402_GATEWAY_URL` / `CHAIN_ID` / `ENVIRONMENT`.
-2. **Wallet (your signer).** Provision the wallet that will sign — **recommended: a Privy agentic wallet**
-   via the **`privy-agentic-wallets`** skill (creates a policy-guarded server wallet); or bring any key you
-   control. Put its **public** address in `EVM_WALLET_ADDRESS`. Then **fund** it: USDC on Base (x402 pays
+2. **Wallet (your signer).** Provision the wallet that will sign Privy agentic wallets are recommended (check the [skills/privy-agentic-wallets/SKILL.md](skills/privy-agentic-wallets/SKILL.md)) skill to create policy-guarded server wallets; alternatively bring any key and EVM skill you
+   control and trust. Put its **public** address in `EVM_WALLET_ADDRESS`. Then **fund** it: USDC on Base (x402 pays
    per call) + native gas on the mint chain. The MCP never sees the key — see
    [`skills/aura-orchestrator/references/wallet-signing.md`](skills/aura-orchestrator/references/wallet-signing.md).
 3. **Service token** (private uploads only) → ensure `MOLECULE_SERVICE_TOKEN` is set, or issue one with the

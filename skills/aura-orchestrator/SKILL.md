@@ -1,7 +1,9 @@
 ---
 name: aura-orchestrator
-description: End-to-end DeSci molecule — POI registration, IP-NFT minting, Molecule authentication, project creation, file upload (public or private/encrypted), and announcement. Single-agent sequential execution. The `molecule` MCP server CRAFTS every request/payload (it is custody-free — it never holds a key, signs, or broadcasts); YOUR wallet (a Privy agentic wallet — recommended — or any key you control) does all signing/sending.
+description: End-to-end DeSci molecule — POI registration, IP-NFT minting, Molecule authentication, project creation, file upload (public or private/encrypted), and announcement. Single-agent sequential execution. The `molecule` MCP server CRAFTS every request/payload (it is custody-free — it never holds a key, signs, or broadcasts); YOUR wallet (we recommend Privy agentic wallets or any key & rpc server you can use to interact with an EVM blockchain) does all signing/sending.
+platforms: [macos, linux]
 metadata:
+  # Claude Code: these are injected into the MCP subprocess via settings.json / settings.local.json
   env_vars:
     - MOLECULE_CLIENT_URL
     - MOLECULE_LABS_URL
@@ -14,9 +16,99 @@ metadata:
     - POI_API_KEY
     - MOLECULE_API_KEY
     - MOLECULE_SERVICE_TOKEN
+  hermes:
+    tags: [desci, blockchain, ip-nft, molecule, x402, encryption, privy, web3]
+    category: web3
+    requires_toolsets: [terminal]
+    config:
+      - key: MOLECULE_CLIENT_URL
+        description: "Molecule Labs client base URL"
+        prompt: "Enter your Molecule Labs client URL (e.g. https://app.molecule.to)"
+      - key: MOLECULE_LABS_URL
+        description: "Molecule Labs GraphQL API URL"
+        prompt: "Enter the Molecule Labs API URL"
+      - key: IPNFT_CONTRACT_ADDRESS
+        description: "IP-NFT smart contract address on-chain"
+        prompt: "Enter the IPNFT contract address (0x...)"
+      - key: ACCESS_RESOLVER_ADDRESS
+        description: "AccessResolver contract address used for encrypted file access conditions"
+        prompt: "Enter the AccessResolver contract address (0x...)"
+      - key: X402_GATEWAY_URL
+        description: "x402 payment gateway URL"
+        prompt: "Enter the x402 gateway URL"
+      - key: EVM_WALLET_ADDRESS
+        description: "Your operating wallet PUBLIC address — this is an address, NOT a private key"
+        prompt: "Enter your EVM wallet public address (0x...)"
+      - key: CHAIN_ID
+        description: "EVM chain ID (1=Ethereum mainnet, 8453=Base, 11155111=Sepolia, 84532=Base Sepolia)"
+        default: "8453"
+        prompt: "Enter the chain ID"
+      - key: POI_API_KEY
+        description: "API key for Proof of Invention registration endpoint"
+        prompt: "Enter your POI API key"
+      - key: MOLECULE_API_KEY
+        description: "Molecule Labs API key for GraphQL mutations"
+        prompt: "Enter your Molecule API key"
 ---
 
 # Aura Orchestrator
+
+## Prerequisites
+
+This skill requires the **`molecule` MCP server** to be running as a local stdio process before you
+execute any step. The server is included in this repository at `mcp/server.py` and requires Python + `uv`.
+
+**Start the MCP server** (set `MOLECULE_PLUGIN_ROOT` to wherever you cloned / installed this repo):
+
+```bash
+cd $MOLECULE_PLUGIN_ROOT && uv run mcp/server.py
+```
+
+Or configure it in your harness's MCP server block:
+
+```json
+{
+  "mcpServers": {
+    "molecule": {
+      "command": "uv",
+      "args": ["run", "/path/to/mol-labs-plugin/mcp/server.py"],
+      "env": {
+        "MOLECULE_CLIENT_URL": "...",
+        "MOLECULE_LABS_URL": "...",
+        "IPNFT_CONTRACT_ADDRESS": "...",
+        "ACCESS_RESOLVER_ADDRESS": "...",
+        "X402_GATEWAY_URL": "...",
+        "EVM_WALLET_ADDRESS": "...",
+        "CHAIN_ID": "8453",
+        "POI_API_KEY": "...",
+        "MOLECULE_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+All `mcp__molecule__*` tool calls below are dispatched to this server. In Claude Code the tool prefix is
+`mcp__molecule__<tool>`; in other harnesses the naming convention may differ — consult your harness docs
+for how stdio MCP tools are addressed, and substitute accordingly.
+
+**`shared_cache`** is used throughout this skill to persist values across steps (reservation IDs, hashes,
+wallet address, etc.). In Claude Code this is a built-in tool. In other harnesses, use whichever
+key-value store your runtime provides (an in-memory dict, a scratch file, or your harness's equivalent)
+— the important thing is that values written in one step are readable in later steps within the same run.
+
+**`read_file`** is used for PDF text extraction. In Claude Code this is a built-in tool. In Hermes or
+other harnesses, use your runtime's file-reading or document-parsing tool.
+
+**Wallet / signing** either provision a Privy agentic wallet (recommended, check the bundled
+`privy-agentic-wallets` skill), or reuse your own wallet skill / EOA / rpc logic. If you do, your harness must be able to call the wallet's
+signing RPC (`eth_signTypedData_v4`, `personal_sign`, `eth_sendTransaction`). See
+[references/wallet-signing.md](references/wallet-signing.md).
+
+**`MOLECULE_SERVICE_TOKEN`** (private uploads only) is a secret JWT — do NOT expose it via a config
+prompt. Store it in your harness's secrets store and inject it as an env var into the MCP server process.
+
+---
 
 Complete DeSci molecule executed as one continuous sequence of tool calls.
 Do NOT stop, report progress, or output text between steps — execute ALL steps as one uninterrupted flow.
