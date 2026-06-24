@@ -23,26 +23,39 @@ metadata:
     config:
       - key: MOLECULE_CLIENT_URL
         description: "Molecule Labs client base URL"
-        prompt: "Enter your Molecule Labs client URL (e.g. https://app.molecule.to)"
+        default: "https://testnet.molecule.xyz/"
+        prompt: "Enter your Molecule Labs client URL (staging default: https://testnet.molecule.xyz/)"
       - key: MOLECULE_LABS_URL
         description: "Molecule Labs GraphQL API URL"
-        prompt: "Enter the Molecule Labs API URL"
+        default: "https://staging.graphql.api.molecule.xyz/graphql"
+        prompt: "Enter the Molecule Labs API URL (staging default: https://staging.graphql.api.molecule.xyz/graphql)"
       - key: IPNFT_CONTRACT_ADDRESS
         description: "IP-NFT smart contract address on-chain"
-        prompt: "Enter the IPNFT contract address (0x...)"
+        default: "0x152B444e60C526fe4434C721561a077269FcF61a"
+        prompt: "Enter the IPNFT contract address (Sepolia staging: 0x152B444e60C526fe4434C721561a077269FcF61a)"
       - key: ACCESS_RESOLVER_ADDRESS
         description: "AccessResolver contract address used for encrypted file access conditions"
-        prompt: "Enter the AccessResolver contract address (0x...)"
+        default: "0xd9b492fd34b1579C052b2EA25970178B3011Ce6B"
+        prompt: "Enter the AccessResolver contract address (Sepolia staging: 0xd9b492fd34b1579C052b2EA25970178B3011Ce6B)"
       - key: X402_GATEWAY_URL
         description: "x402 payment gateway URL"
-        prompt: "Enter the x402 gateway URL"
+        default: "https://zgnyn6izbk.execute-api.eu-central-2.amazonaws.com/prod"
+        prompt: "Enter the x402 gateway URL (staging default: https://zgnyn6izbk.execute-api.eu-central-2.amazonaws.com/prod)"
       - key: EVM_WALLET_ADDRESS
         description: "Your operating wallet PUBLIC address — this is an address, NOT a private key"
         prompt: "Enter your EVM wallet public address (0x...)"
       - key: CHAIN_ID
         description: "EVM chain ID (1=Ethereum mainnet, 8453=Base, 11155111=Sepolia, 84532=Base Sepolia)"
-        default: "8453"
-        prompt: "Enter the chain ID"
+        default: "11155111"
+        prompt: "Enter the chain ID (staging uses Sepolia: 11155111)"
+      - key: ENVIRONMENT
+        description: "Deployment environment tag read by build_access_conditions"
+        default: "staging"
+        prompt: "Enter the environment (staging)"
+      - key: EXPERIMENT_COST_CENTS
+        description: "Default experiment / funding cost in USD cents (used in non-interactive runs)"
+        default: "1"
+        prompt: "Enter the default experiment cost in cents (staging default: 1)"
       - key: POI_API_KEY
         description: "API key for Proof of Invention registration endpoint"
         prompt: "Enter your POI API key"
@@ -73,15 +86,18 @@ Or configure it in your harness's MCP server block:
       "command": "uv",
       "args": ["run", "/path/to/mol-labs-plugin/mcp/server.py"],
       "env": {
-        "MOLECULE_CLIENT_URL": "...",
-        "MOLECULE_LABS_URL": "...",
-        "IPNFT_CONTRACT_ADDRESS": "...",
-        "ACCESS_RESOLVER_ADDRESS": "...",
-        "X402_GATEWAY_URL": "...",
-        "EVM_WALLET_ADDRESS": "...",
-        "CHAIN_ID": "8453",
-        "POI_API_KEY": "...",
-        "MOLECULE_API_KEY": "..."
+        "MOLECULE_CLIENT_URL": "https://testnet.molecule.xyz/",
+        "MOLECULE_LABS_URL": "https://staging.graphql.api.molecule.xyz/graphql",
+        "IPNFT_CONTRACT_ADDRESS": "0x152B444e60C526fe4434C721561a077269FcF61a",
+        "ACCESS_RESOLVER_ADDRESS": "0xd9b492fd34b1579C052b2EA25970178B3011Ce6B",
+        "X402_GATEWAY_URL": "https://zgnyn6izbk.execute-api.eu-central-2.amazonaws.com/prod",
+        "CHAIN_ID": "11155111",
+        "ENVIRONMENT": "staging",
+        "EXPERIMENT_COST_CENTS": "1",
+        "EVM_WALLET_ADDRESS": "<your-wallet-address>",
+        "POI_API_KEY": "<secret>",
+        "MOLECULE_API_KEY": "<secret>",
+        "MOLECULE_SERVICE_TOKEN": "<secret — private uploads only>"
       }
     }
   }

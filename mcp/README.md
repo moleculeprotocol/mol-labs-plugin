@@ -103,6 +103,23 @@ only ever needs the **public** `EVM_WALLET_ADDRESS`.
 If a tool needs a variable that isn't set, it returns a clear error naming the missing
 variable(s) — it never guesses an endpoint or address.
 
+#### Staging environment (Sepolia — default for new integrations)
+
+Use these values to get started. Contracts run on Sepolia (chain 11155111); the x402 gateway and
+GraphQL API point at the staging stack. Secrets (`POI_API_KEY`, `MOLECULE_API_KEY`,
+`MOLECULE_SERVICE_TOKEN`) must be obtained from Molecule Labs.
+
+| Variable | Staging value |
+|----------|---------------|
+| `MOLECULE_CLIENT_URL` | `https://testnet.molecule.xyz/` |
+| `MOLECULE_LABS_URL` | `https://staging.graphql.api.molecule.xyz/graphql` |
+| `IPNFT_CONTRACT_ADDRESS` | `0x152B444e60C526fe4434C721561a077269FcF61a` |
+| `ACCESS_RESOLVER_ADDRESS` | `0xd9b492fd34b1579C052b2EA25970178B3011Ce6B` |
+| `X402_GATEWAY_URL` | `https://zgnyn6izbk.execute-api.eu-central-2.amazonaws.com/prod` |
+| `CHAIN_ID` | `11155111` |
+| `ENVIRONMENT` | `staging` |
+| `EXPERIMENT_COST_CENTS` | `1` |
+
 ### Verify offline
 
 `.venv/bin/python smoke.py` lists all tools and exercises the pure-compute ones — no network or
