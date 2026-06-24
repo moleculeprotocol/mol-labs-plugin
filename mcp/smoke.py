@@ -85,9 +85,22 @@ async def main() -> None:
             ok &= r["conditions"][0]["functionName"] == "isAuthorizedSignerForIpnft" and r["conditions"][0]["chain"] == "baseSepolia"
             print("ipnft-signer ok:", r["conditions"][0]["functionName"], r["conditions"][0]["chain"])
 
-            r = await call("privy_get_wallet_address", {})  # env path, no network
-            ok &= r["address"] == "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c"
-            print("privy_get_wallet_address (env, no net):", r)
+            # prepare_transaction is pure compute (no signing / no network): it only
+            # normalizes the fields the caller hands to their own wallet.
+            r = await call("prepare_transaction", {
+                "to": "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c",
+                "data": "0xdeadbeef",
+                "value": "1000000000000000",
+                "chainId": "84532",
+            })
+            tx = r["transaction"]
+            ok &= (
+                tx["caip2"] == "eip155:84532"
+                and tx["value"] == "1000000000000000"
+                and tx["valueWei"] == "0x38d7ea4c68000"
+                and tx["data"] == "0xdeadbeef"
+            )
+            print("prepare_transaction (pure, no signing):", tx)
 
             # round-trip encrypt/decrypt via dekHandle (no network: inject a fake DEK)
             import base64 as b64

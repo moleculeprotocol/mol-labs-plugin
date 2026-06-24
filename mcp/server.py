@@ -12,14 +12,30 @@
 # ///
 """molecule-mcp — stdio MCP server for the Molecule DeSci skills.
 
-Replaces every ``curl`` / ``http_request`` / ``node -e`` step in the
-``aura-orchestrator`` skill (public and private/encrypted data-room uploads)
-with a typed MCP tool, so the agent calls one tool per operation instead of
-hand-assembling shell commands.
+CUSTODY-FREE BY DESIGN. This server NEVER holds a private key, signs a message,
+directly authorizes a payment, or broadcasts an on-chain transaction. It only *crafts*
+the requests, EIP-712 typed-data, calldata, and payloads that the Molecule protocol needs, and
+performs the non-signing HTTP requests that surround them (POI registration, Labs
+GraphQL, the x402 challenge fetch + paid submission, S3 uploads). Every step that
+requires a wallet is handed back to the **caller** to sign/send with their own
+signer — a Privy agentic wallet (the recommended first option) or any key they
+control — and the signature / transaction hash is passed back in to continue.
 
-Written in Python (FastMCP) and run over stdio so it works under any
-MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter —
-no Bun/Node required.
+The split, concretely:
+  - prepare_transaction ....... returns {to, data, value, chainId} for the caller
+                                to sign + broadcast with their wallet (POI anchor,
+                                IP-NFT mint, NFT transfer).
+  - x402_prepare / x402_submit  prepare returns the EIP-712 TransferWithAuthorization
+                                the caller signs; submit takes that signature and
+                                posts the paid request. The server signs nothing.
+  - service_signin_message /    prepare returns the sign-in message the caller
+    service_token_create        personal_signs; create exchanges that signature for
+                                the Labs JWT. The server signs nothing.
+The rest (abi_encode, encrypt_file/decrypt_file, build_access_conditions, the DEK
+tools, sha256_file, hex_to_uint256) is pure compute or service-token HTTP.
+
+Written in Python (FastMCP) and run over stdio so it works under any MCP-capable
+harness (Claude Code, Codex, …) with only a Python interpreter — no Bun/Node required.
 
 This server targets the **V2 GraphQL surface** (the one live on production), keyed on
 ``ipnftUid`` (``{contractAddress}_{tokenId}``). The retired OCL surface (``oclId``,
@@ -27,17 +43,17 @@ This server targets the **V2 GraphQL surface** (the one live on production), key
 is intentionally NOT supported here.
 
 Source-of-truth parity (these tools faithfully replicate the real backend):
-  - x402 payment flow ........ desci-infra/lambda/x402-gateway-lambda/index.ts
-  - x402 mutation whitelist .. desci-infra/lambda/x402-gateway-lambda/mutations.ts
-  - AES-256-GCM envelope ..... desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts
-  - access conditions ........ desci-infra/lambda/common/utils/access-control-conditions.ts
-  - GraphQL field shapes ..... desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql
-  - request shapes / auth .... desci-infra/bruno/desci-labs/v2 + desci-infra/bruno/service-auth
+  - x402 challenge / payment header .. desci-infra/lambda/x402-gateway-lambda/index.ts
+  - x402 mutation whitelist ........... desci-infra/lambda/x402-gateway-lambda/mutations.ts
+  - AES-256-GCM envelope .............. desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts
+  - access conditions ................. desci-infra/lambda/common/utils/access-control-conditions.ts
+  - GraphQL field shapes .............. desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql
+  - request shapes / auth ............. desci-infra/bruno/desci-labs/v2 + desci-infra/bruno/service-auth
 
 Transport: stdio. NOTHING is written to stdout except the JSON-RPC protocol —
 FastMCP owns stdout; all diagnostics go to stderr (see ``log``). Secrets
-(PRIVY_APP_SECRET, the plaintext DEK, service tokens, API keys) are never
-logged or returned to the caller.
+(service tokens, API keys) are never logged or returned to the caller; the server
+holds NO wallet credentials at all.
 """
 
 from __future__ import annotations
@@ -60,7 +76,6 @@ from eth_utils import function_signature_to_4byte_selector
 
 from mcp.server.fastmcp import FastMCP
 
-PRIVY_BASE_URL = "https://api.privy.io"
 HTTP_TIMEOUT = 120.0
 
 mcp = FastMCP("molecule")
@@ -132,54 +147,23 @@ def _json_or_none(resp: httpx.Response) -> Any:
 
 
 # --------------------------------------------------------------------------
-# Privy
+# wallet address (NEVER a key) — the address whose wallet the caller will use to
+# sign. The server only ever needs the public address (for the EIP-3009 `from`,
+# the IP-NFT minter/terms signer, and the service-token adminAddress). The key
+# stays entirely with the caller.
 # --------------------------------------------------------------------------
 
 
-def _privy_auth() -> tuple[tuple[str, str], dict[str, str]]:
-    creds = require_env("PRIVY_APP_ID", "PRIVY_APP_SECRET")
-    return (
-        (creds["PRIVY_APP_ID"], creds["PRIVY_APP_SECRET"]),
-        {"privy-app-id": creds["PRIVY_APP_ID"], "Content-Type": "application/json"},
-    )
-
-
-def privy_rpc(wallet_id: str, body: dict[str, Any]) -> Any:
-    auth, headers = _privy_auth()
-    resp = _client.post(
-        f"{PRIVY_BASE_URL}/v1/wallets/{wallet_id}/rpc",
-        auth=auth,
-        headers=headers,
-        content=json.dumps(body),
-    )
-    if resp.status_code >= 400:
-        raise ToolError(f"Privy RPC failed ({resp.status_code}): {resp.text[:500]}")
-    return _json_or_none(resp)
-
-
-def resolve_wallet_id(explicit: str | None) -> str:
-    wid = explicit or env("PRIVY_WALLET_ID")
-    if not wid:
+def resolve_address(explicit: str | None = None) -> str:
+    addr = explicit or env("EVM_WALLET_ADDRESS")
+    if not addr:
         raise ToolError(
-            "No wallet id available. Pass walletId or set PRIVY_WALLET_ID. "
-            "Use privy_list_wallets / privy_create_wallet to obtain one."
+            "No wallet address available. Pass walletAddress, or set EVM_WALLET_ADDRESS "
+            "to the public address of the wallet that will sign (a Privy agentic wallet — "
+            "the recommended first option — or any key you control). The server never "
+            "needs the private key."
         )
-    return wid
-
-
-def get_wallet_address(wallet_id: str | None = None) -> str:
-    from_env = env("EVM_WALLET_ADDRESS")
-    if from_env:
-        return from_env
-    wid = resolve_wallet_id(wallet_id)
-    auth, headers = _privy_auth()
-    resp = _client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=auth, headers=headers)
-    j = _json_or_none(resp)
-    if resp.status_code >= 400 or not (j and j.get("address")):
-        raise ToolError(
-            f"Could not resolve wallet address ({resp.status_code}): {resp.text[:300]}"
-        )
-    return j["address"]
+    return addr
 
 
 # --------------------------------------------------------------------------
@@ -303,7 +287,7 @@ def assert_confidential_finalize_ok(variables: dict[str, Any] | None) -> None:
 
 
 # --------------------------------------------------------------------------
-# Labs GraphQL (direct)
+# Labs GraphQL (direct, non-signing HTTP)
 # --------------------------------------------------------------------------
 
 LabsAuth = Literal["service-token", "api-key", "none"]
@@ -360,9 +344,12 @@ def labs_graphql_call(
 
 
 # --------------------------------------------------------------------------
-# x402 payment flow (P1–P7) in one call. Mirrors x402-gateway-lambda exactly:
-#   P1 send -> P2 decode payment-required -> P3 wallet -> P4 nonce/validity ->
-#   P5 Privy EIP-712 sign -> P6 build+base64 header -> P7 retry PAYMENT-SIGNATURE
+# x402 payment — PREPARE (build the EIP-712 the caller signs) and SUBMIT (post
+# the caller's signature). The server signs NOTHING. Mirrors x402-gateway-lambda:
+#   prepare: P1 send -> P2 decode payment-required -> P3 wallet -> P4 nonce/validity
+#            -> build TransferWithAuthorization typed-data
+#   << caller signs typedData with their wallet (eth_signTypedData_v4) >>
+#   submit:  P6 build+base64 PAYMENT-SIGNATURE header -> P7 retry
 # --------------------------------------------------------------------------
 
 
@@ -394,21 +381,20 @@ def _chain_id_from_network(network: str) -> int:
     raise ToolError(f'Cannot derive chainId from network "{network}".')
 
 
-def run_x402_pay(
+def _x402_prepare(
     mutation: str,
     query: str,
     variables: dict[str, Any] | None,
+    wallet_address: str,
     gateway_url: str | None,
-    wallet_id: str | None,
 ) -> dict[str, Any]:
-    # Fail-closed: never let a confidential IP-NFT be finalized as a public /
-    # plaintext file, even if the agent reaches this with the wrong variables.
+    # Fail-closed: never let a confidential IP-NFT be set up for a public /
+    # plaintext finalize, even at the prepare step.
     if mutation == "finishCreateOrUpdateFileV2":
         assert_confidential_finalize_ok(variables)
     gateway = gateway_url or env("X402_GATEWAY_URL")
     if not gateway:
         raise ToolError("X402_GATEWAY_URL is not set.")
-    wid = resolve_wallet_id(wallet_id)
     endpoint = f"{gateway.rstrip('/')}/x402/labs/{mutation}"
     body_str = json.dumps({"query": query, "variables": variables or {}})
 
@@ -439,36 +425,25 @@ def run_x402_pay(
     if not amount or not asset or not pay_to:
         raise ToolError(f'x402 challenge for "{mutation}" is missing amount/asset/payTo.')
 
-    # P3 — wallet address. EIP-3009 requires the authorization `from` to be the
-    # address whose key signs. Privy always signs with the wallet's own key, so a
-    # stale EVM_WALLET_ADDRESS that differs from the Privy wallet produces a
-    # signature the facilitator recovers to a different signer and rejects with a
-    # generic "Payment verification failed". Catch that here with a clear message.
-    wallet_address = get_wallet_address(wid)
-    _auth, _phdr = _privy_auth()
-    _wj = _json_or_none(_client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=_auth, headers=_phdr))
-    signer_address = (_wj or {}).get("address")
-    if signer_address and wallet_address.lower() != signer_address.lower():
-        raise ToolError(
-            f"x402 payment would be rejected: the EIP-3009 `from` ({wallet_address}) "
-            f"does not match the Privy signing wallet {wid} ({signer_address}). The "
-            f"facilitator recovers the signer from the signature and fails verification "
-            f"when signer != from. Set EVM_WALLET_ADDRESS to {signer_address}, or point "
-            f"PRIVY_WALLET_ID at the {wallet_address} wallet."
-        )
-
-    # P4 — nonce, validAfter, validBefore.
+    # P3/P4 — `from` is the caller's wallet (EIP-3009 requires from == signer);
+    # fresh nonce + validity window.
     now = int(time.time())
     nonce = "0x" + secrets.token_hex(32)
     valid_after = str(now - 600)
     valid_before = str(now + max_timeout)
     chain_id = _chain_id_from_network(network)
 
-    # P5 — EIP-712 TransferWithAuthorization signed by the Privy wallet.
-    # NOTE: Privy's wallet-RPC typed_data schema is snake_case all the way down —
-    # the primary type field is `primary_type`, not the EIP-712 `primaryType`
-    # (see EthereumSignTypedDataRpcInput.Params.TypedData in @privy-io/node). The
-    # API rejects camelCase `primaryType` with a 400.
+    # Standard EIP-712 TransferWithAuthorization (camelCase primaryType). The
+    # CALLER signs this with their wallet (Privy: remap primaryType->primary_type
+    # for Privy's wallet-RPC; a raw key signs it directly). The server does NOT.
+    authorization = {
+        "from": wallet_address,
+        "to": pay_to,
+        "value": amount,
+        "validAfter": valid_after,
+        "validBefore": valid_before,
+        "nonce": nonce,
+    }
     typed_data = {
         "types": {
             "EIP712Domain": [
@@ -486,57 +461,55 @@ def run_x402_pay(
                 {"name": "nonce", "type": "bytes32"},
             ],
         },
-        "primary_type": "TransferWithAuthorization",
+        "primaryType": "TransferWithAuthorization",
         "domain": {
             "name": extra.get("name"),
             "version": extra.get("version"),
             "chainId": chain_id,
             "verifyingContract": asset,
         },
-        "message": {
-            "from": wallet_address,
-            "to": pay_to,
-            "value": amount,
-            "validAfter": valid_after,
-            "validBefore": valid_before,
-            "nonce": nonce,
-        },
+        "message": authorization,
     }
-    sign_res = privy_rpc(
-        wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typed_data}}
-    )
-    signature = (sign_res or {}).get("data", {}).get("signature")
+    return {
+        "endpoint": endpoint,
+        "query": query,
+        "variables": variables or {},
+        "accepted": accepted,
+        "resource": resource,
+        "network": network,
+        "chainId": chain_id,
+        "authorization": authorization,
+        "typedData": typed_data,
+    }
+
+
+def _x402_submit(prepared: dict[str, Any], signature: str) -> dict[str, Any]:
+    if not isinstance(prepared, dict):
+        raise ToolError("`prepared` must be the object returned by x402_prepare.")
+    for k in ("endpoint", "query", "accepted", "authorization"):
+        if k not in prepared:
+            raise ToolError(f"`prepared` is missing '{k}' — pass the x402_prepare result verbatim.")
     if not signature:
-        raise ToolError(
-            f"Privy did not return a signature for the x402 payment. Raw: {json.dumps(sign_res)[:400]}"
-        )
+        raise ToolError("`signature` (the caller's EIP-712 signature of prepared.typedData) is required.")
+    variables = prepared.get("variables") or {}
+    # Re-apply the fail-closed finalize guard at submit time.
+    if "finishCreateOrUpdateFileV2" in (prepared.get("query") or ""):
+        assert_confidential_finalize_ok(variables)
 
     # P6 — build the payment payload and base64-encode it.
     payment_payload = {
         "x402Version": 2,
-        "resource": resource,
-        "accepted": accepted,
-        "payload": {
-            "signature": signature,
-            "authorization": {
-                "from": wallet_address,
-                "to": pay_to,
-                "value": amount,
-                "validAfter": valid_after,
-                "validBefore": valid_before,
-                "nonce": nonce,
-            },
-        },
+        "resource": prepared.get("resource"),
+        "accepted": prepared["accepted"],
+        "payload": {"signature": signature, "authorization": prepared["authorization"]},
     }
     payment_header = base64.b64encode(json.dumps(payment_payload).encode()).decode()
+    body_str = json.dumps({"query": prepared["query"], "variables": variables})
 
     # P7 — retry with PAYMENT-SIGNATURE (the only header the gateway reads).
     paid_res = _client.post(
-        endpoint,
-        headers={
-            "Content-Type": "application/json",
-            "PAYMENT-SIGNATURE": payment_header,
-        },
+        prepared["endpoint"],
+        headers={"Content-Type": "application/json", "PAYMENT-SIGNATURE": payment_header},
         content=body_str,
     )
     paid = _json_or_none(paid_res)
@@ -545,9 +518,7 @@ def run_x402_pay(
             f"x402 paid request returned non-JSON ({paid_res.status_code}): {paid_res.text[:500]}"
         )
     settlement = {}
-    settle_hdr = paid_res.headers.get("x-payment-response") or paid_res.headers.get(
-        "payment-response"
-    )
+    settle_hdr = paid_res.headers.get("x-payment-response") or paid_res.headers.get("payment-response")
     if settle_hdr:
         settlement["payment-response"] = settle_hdr
     return {"data": paid.get("data"), "errors": paid.get("errors"), "settlement": settlement}
@@ -686,276 +657,95 @@ def abi_encode_impl(function_signature: str, args: list[Any]) -> str:
 # TOOLS
 # ==========================================================================
 
-# ---- Privy: wallet management + signing + sending -----------------------
+# ---- Wallet handoff: the server prepares, the CALLER's wallet signs/sends ----
+# None of these tools sign or broadcast. They craft the exact request/typed-data
+# the caller then signs and sends with their own wallet — a Privy agentic wallet
+# (the recommended first option) or any key the caller controls.
 
 
 @mcp.tool()
-def privy_get_wallet_address(walletId: str | None = None) -> str:
-    """Resolve the agent wallet address. Returns $EVM_WALLET_ADDRESS if set,
-    otherwise looks up the Privy server wallet by id. Replaces aura's
-    get_wallet_address / 'resolve the wallet address' curl."""
-    address = get_wallet_address(walletId)
-    return dump({"address": address, "walletId": walletId or env("PRIVY_WALLET_ID")})
-
-
-@mcp.tool()
-def privy_list_wallets(chainType: str = "ethereum") -> str:
-    """List existing Privy server wallets (GET /v1/wallets). Use during wallet
-    setup to reuse an existing wallet."""
-    auth, headers = _privy_auth()
-    resp = _client.get(
-        f"{PRIVY_BASE_URL}/v1/wallets",
-        params={"chain_type": chainType},
-        auth=auth,
-        headers=headers,
-    )
-    if resp.status_code >= 400:
-        raise ToolError(f"Privy list wallets failed ({resp.status_code}): {resp.text[:300]}")
-    return dump(_json_or_none(resp))
-
-
-@mcp.tool()
-def privy_create_policy(
-    name: str = "DeSci agent policy",
-    chainId: str | None = None,
-    maxValueWei: str = "10000000000000000",
-) -> str:
-    """Create a restrictive DeSci agent policy: single-chain (CHAIN_ID) + a
-    per-tx value cap. Returns {policyId}."""
-    cid = chainId or env("CHAIN_ID")
-    if not cid:
-        raise ToolError("chainId not provided and CHAIN_ID is not set.")
-    body = {
-        "version": "1.0",
-        "name": name,
-        "chain_type": "ethereum",
-        "rules": [
-            {
-                "name": "Single chain only",
-                "method": "eth_sendTransaction",
-                "conditions": [
-                    {"field_source": "ethereum_transaction", "field": "chain_id", "operator": "eq", "value": cid}
-                ],
-                "action": "ALLOW",
-            },
-            {
-                "name": "Per-tx value cap",
-                "method": "eth_sendTransaction",
-                "conditions": [
-                    {"field_source": "ethereum_transaction", "field": "value", "operator": "lte", "value": maxValueWei}
-                ],
-                "action": "ALLOW",
-            },
-        ],
-    }
-    auth, headers = _privy_auth()
-    resp = _client.post(f"{PRIVY_BASE_URL}/v1/policies", auth=auth, headers=headers, content=json.dumps(body))
-    if resp.status_code >= 400:
-        raise ToolError(f"Privy create policy failed ({resp.status_code}): {resp.text[:300]}")
-    j = _json_or_none(resp)
-    return dump({"policyId": (j or {}).get("id"), "policy": j})
-
-
-@mcp.tool()
-def privy_create_wallet(policyIds: list[str] | None = None) -> str:
-    """Create a Privy server wallet, optionally attaching policy ids. Returns
-    {walletId, address}. After this, set PRIVY_WALLET_ID for future runs."""
-    body: dict[str, Any] = {"chain_type": "ethereum"}
-    if policyIds:
-        body["policy_ids"] = policyIds
-    auth, headers = _privy_auth()
-    resp = _client.post(f"{PRIVY_BASE_URL}/v1/wallets", auth=auth, headers=headers, content=json.dumps(body))
-    if resp.status_code >= 400:
-        raise ToolError(f"Privy create wallet failed ({resp.status_code}): {resp.text[:300]}")
-    j = _json_or_none(resp)
-    return dump({"walletId": (j or {}).get("id"), "address": (j or {}).get("address"), "wallet": j})
-
-
-@mcp.tool()
-def privy_sign_message(message: str, walletId: str | None = None, encoding: Literal["utf-8", "hex"] = "utf-8") -> str:
-    """EIP-191 personal_sign via the Privy wallet. Used to sign the IP-NFT terms
-    message and the service-token sign-in message. Returns {signature}."""
-    wid = resolve_wallet_id(walletId)
-    res = privy_rpc(wid, {"method": "personal_sign", "params": {"message": message, "encoding": encoding}})
-    signature = (res or {}).get("data", {}).get("signature")
-    if not signature:
-        raise ToolError(f"No signature returned. Raw: {json.dumps(res)[:300]}")
-    return dump({"signature": signature})
-
-
-@mcp.tool()
-def privy_sign_typed_data(typedData: dict, walletId: str | None = None) -> str:
-    """Generic eth_signTypedData_v4 via the Privy wallet. Pass the full EIP-712
-    typed-data object using the standard camelCase `primaryType` key (Privy wraps
-    it as params.typed_data). x402_pay does this internally; use this only for
-    ad-hoc signing. Returns {signature}."""
-    wid = resolve_wallet_id(walletId)
-    # Privy's wallet-RPC typed_data schema uses snake_case `primary_type`; accept
-    # the standard EIP-712 camelCase `primaryType` from callers and remap it.
-    if isinstance(typedData, dict) and "primaryType" in typedData and "primary_type" not in typedData:
-        typedData = {**typedData, "primary_type": typedData["primaryType"]}
-        typedData.pop("primaryType", None)
-    res = privy_rpc(wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typedData}})
-    signature = (res or {}).get("data", {}).get("signature")
-    if not signature:
-        raise ToolError(f"No signature returned. Raw: {json.dumps(res)[:300]}")
-    return dump({"signature": signature})
-
-
-@mcp.tool()
-def privy_send_transaction(
+def prepare_transaction(
     to: str,
     data: str | None = None,
     value: str | None = None,
     chainId: str | None = None,
-    walletId: str | None = None,
 ) -> str:
-    """Send a transaction from the Privy wallet (eth_sendTransaction with
-    caip2 eip155:<chainId>). Replaces aura's sign_and_send_transaction (POI
-    anchor, IP-NFT mint, NFT transfer). value is decimal wei (string).
-    Returns {txHash}."""
-    wid = resolve_wallet_id(walletId)
-    cid = chainId or env("CHAIN_ID")
-    if not cid:
-        raise ToolError("chainId not provided and CHAIN_ID is not set.")
-    transaction: dict[str, Any] = {"to": to}
-    if data:
-        transaction["data"] = data
-    if value:
-        # Privy's transaction.value must be hex-encoded wei ("0x…"); the tool's
-        # documented input is decimal wei, so convert (and pass hex through).
-        v = str(value).strip()
-        transaction["value"] = v if v.startswith("0x") else hex(int(v))
-    res = privy_rpc(
-        wid,
-        {"method": "eth_sendTransaction", "caip2": f"eip155:{cid}", "params": {"transaction": transaction}},
-    )
-    data_obj = (res or {}).get("data", {}) or {}
-    tx_hash = data_obj.get("hash") or data_obj.get("transaction_hash") or (res or {}).get("hash")
-    if not tx_hash:
-        raise ToolError(f"No tx hash returned. Raw: {json.dumps(res)[:400]}")
-    return dump({"txHash": tx_hash})
-
-
-# Public fallback RPC endpoints by chain id, used by privy_send_raw_transaction
-# when neither rpcUrl nor EVM_RPC_URL is provided.
-_DEFAULT_RPC_BY_CHAIN: dict[str, str] = {
-    "11155111": "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia L1
-}
-
-
-def _chain_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
-    """Minimal JSON-RPC call against an EVM node (live nonce + raw broadcast)."""
-    resp = _client.post(
-        rpc_url,
-        headers={"content-type": "application/json"},
-        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
-    )
-    j = _json_or_none(resp)
-    if resp.status_code >= 400 or not isinstance(j, dict) or j.get("error") or "result" not in j:
-        err = j.get("error") if isinstance(j, dict) else None
-        raise ToolError(
-            f"EVM RPC {method} failed ({resp.status_code}): "
-            + (json.dumps(err) if err else resp.text[:300])
-        )
-    return j["result"]
-
-
-@mcp.tool()
-def privy_send_raw_transaction(
-    to: str,
-    data: str | None = None,
-    value: str | None = None,
-    chainId: str | None = None,
-    walletId: str | None = None,
-    rpcUrl: str | None = None,
-    gasLimit: str | None = None,
-    maxFeePerGas: str | None = None,
-    maxPriorityFeePerGas: str | None = None,
-) -> str:
-    """Sign with Privy (eth_signTransaction, SIGN-ONLY) then broadcast the raw tx
-    yourself via eth_sendRawTransaction against an EVM RPC. Use this for the IP-NFT
-    `safeTransferFrom` (Phase 6 transfer): Privy's eth_sendTransaction returns a
-    hash but never broadcasts safeTransferFrom for the agent wallet — the "phantom
-    hash" — even though mint/POI broadcast fine, so keep using privy_send_transaction
-    for those. Resolves the live `pending` nonce so the call is re-runnable. rpcUrl
-    falls back to EVM_RPC_URL, then a public node for known chains. value is decimal
-    wei (or 0x hex). Gas is auto-estimated (eth_estimateGas ×1.2) unless gasLimit is
-    passed — a flat default reverts mint out-of-gas; EIP-1559 fees default to 5/2 gwei.
-    Returns {txHash, nonce, from, gasLimit}."""
-    wid = resolve_wallet_id(walletId)
+    """Craft an Ethereum transaction request for the CALLER to sign + broadcast
+    with their own wallet (POI anchor, IP-NFT mint, NFT transfer). This server
+    does NOT sign or send — it only assembles and normalizes the fields. Build
+    `data` with abi_encode. value is decimal wei (or 0x hex); it is returned in
+    both decimal and hex. Returns {transaction:{to,data,value,valueWei,chainId,
+    caip2}, note}. Hand `transaction` to your wallet's send-transaction call
+    (Privy: eth_sendTransaction; raw key: sign + eth_sendRawTransaction) and feed
+    the resulting txHash back into the next step."""
     cid = str(chainId or env("CHAIN_ID") or "")
     if not cid:
         raise ToolError("chainId not provided and CHAIN_ID is not set.")
-    rpc = rpcUrl or env("EVM_RPC_URL") or _DEFAULT_RPC_BY_CHAIN.get(cid)
-    if not rpc:
-        raise ToolError(
-            f"No EVM RPC endpoint for chainId {cid}. Pass rpcUrl or set EVM_RPC_URL."
-        )
-
-    # Resolve the SENDER (signer) address from the Privy wallet record directly.
-    # Do NOT use get_wallet_address(): it prefers EVM_WALLET_ADDRESS, which in the
-    # aura flow is the transfer RECIPIENT, not the sender — that would query the
-    # wrong account's nonce.
-    auth, headers = _privy_auth()
-    wj = _json_or_none(_client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=auth, headers=headers))
-    sender = (wj or {}).get("address")
-    if not sender:
-        raise ToolError(f"Could not resolve signer address for Privy wallet {wid}.")
-
-    # Live pending nonce keeps the tool re-runnable after a stuck/failed attempt.
-    nonce = int(_chain_rpc(rpc, "eth_getTransactionCount", [sender, "pending"]), 16)
-
-    val = "0x0"
-    if value:
-        v = str(value).strip()
-        val = v if v.startswith("0x") else hex(int(v))
-
-    # Gas limit: an explicit override wins; otherwise estimate with a 20% buffer.
-    # A flat default is unsafe — a transfer is ~51k but mintReservation needs
-    # ~176k, so a fixed 100k silently reverts OUT-OF-GAS on mint. Note that an
-    # eth_call simulation can still PASS in that window (it assumes a high gas
-    # cap), so it is a misleading signal — eth_estimateGas is the real check.
-    if gasLimit:
-        gas_limit_hex = gasLimit
-    else:
-        est_call: dict[str, Any] = {"from": sender, "to": to, "value": val}
-        if data:
-            est_call["data"] = data
-        try:
-            est = int(_chain_rpc(rpc, "eth_estimateGas", [est_call]), 16)
-            gas_limit_hex = hex(est * 12 // 10)  # ×1.2 buffer
-        except ToolError:
-            gas_limit_hex = "0x61a80"  # 400000 fallback (covers mint ~176k + transfers)
-
-    transaction: dict[str, Any] = {
-        "to": to,
-        "value": val,
-        "chain_id": int(cid),
-        "nonce": nonce,
-        # EIP-1559 fee defaults from privy_transfer_v5.sh (5 gwei / 2 gwei);
-        # override per chain congestion via the params above.
-        "max_fee_per_gas": maxFeePerGas or "0x12a05f200",
-        "max_priority_fee_per_gas": maxPriorityFeePerGas or "0x77359400",
-        "gas_limit": gas_limit_hex,
-        "type": 2,
-    }
+    tx: dict[str, Any] = {"to": to, "chainId": int(cid), "caip2": f"eip155:{cid}"}
     if data:
-        transaction["data"] = data
-
-    res = privy_rpc(
-        wid,
-        {"chain_type": "ethereum", "method": "eth_signTransaction", "params": {"transaction": transaction}},
+        tx["data"] = data
+    if value is not None and str(value).strip() != "":
+        v = str(value).strip()
+        wei = int(v, 16) if v.lower().startswith("0x") else int(v)
+        tx["value"] = str(wei)  # decimal wei
+        tx["valueWei"] = hex(wei)  # 0x hex wei (what most wallet RPCs want)
+    return dump(
+        {
+            "transaction": tx,
+            "note": (
+                "Sign and broadcast this with YOUR wallet (Privy agentic wallet recommended; "
+                "or any key you control). This server never signs or sends. Then pass the "
+                "returned txHash to the next step."
+            ),
+        }
     )
-    signed = ((res or {}).get("data") or {}).get("signed_transaction")
-    if not signed:
-        raise ToolError(f"Privy returned no signed_transaction. Raw: {json.dumps(res)[:400]}")
-
-    tx_hash = _chain_rpc(rpc, "eth_sendRawTransaction", [signed])
-    return dump({"txHash": tx_hash, "nonce": nonce, "from": sender, "gasLimit": gas_limit_hex})
 
 
-# ---- Molecule HTTP -------------------------------------------------------
+@mcp.tool()
+def x402_prepare(
+    mutation: str,
+    query: str,
+    variables: dict | None = None,
+    walletAddress: str | None = None,
+    gatewayUrl: str | None = None,
+) -> str:
+    """Prepare a paid x402 mutation WITHOUT signing: fetch the gateway's 402
+    challenge and build the EIP-712 `TransferWithAuthorization` (EIP-3009 USDC)
+    that the CALLER must sign with their wallet. The single top-level GraphQL field
+    in `query` MUST equal `mutation`. `walletAddress` (or EVM_WALLET_ADDRESS) is the
+    EIP-3009 `from` and MUST equal the address that will sign. Returns a `prepared`
+    object — sign `prepared.typedData` with your wallet (Privy: eth_signTypedData_v4,
+    remapping primaryType->primary_type per Privy's RPC; raw key: sign_typed_data),
+    then call x402_submit(prepared, signature). Whitelisted mutations (V2 surface):
+    initiateCreateOrUpdateFileV2, finishCreateOrUpdateFileV2, createAnnouncementV2,
+    createProject, addProjectOwner, generateDataEncryptionKey, decryptDataKey. All
+    data-room args are keyed on ipnftUid ({contractAddress}_{tokenId})."""
+    addr = resolve_address(walletAddress)
+    prepared = _x402_prepare(mutation, query, variables, addr, gatewayUrl)
+    return dump(
+        {
+            "prepared": prepared,
+            "next": (
+                "Sign prepared.typedData with YOUR wallet (Privy agentic wallet recommended), "
+                "then call x402_submit with {prepared, signature}. This server signs nothing."
+            ),
+        }
+    )
+
+
+@mcp.tool()
+def x402_submit(prepared: dict, signature: str) -> str:
+    """Submit a prepared x402 mutation using the CALLER's signature. Pass the
+    `prepared` object returned by x402_prepare verbatim plus the EIP-712
+    `signature` your wallet produced over prepared.typedData. This builds the
+    base64 PAYMENT-SIGNATURE header and posts the paid request — it does NOT sign.
+    Returns {data, errors, settlement}; read data.<mutation> and check
+    isSuccess / error. (A response that reports isSuccess:false is a real business
+    error — surface it.)"""
+    return dump(_x402_submit(prepared, signature))
+
+
+# ---- Molecule HTTP (non-signing) -----------------------------------------
 
 
 @mcp.tool()
@@ -963,7 +753,8 @@ def poi_register(filePath: str, clientUrl: str | None = None, contentType: str =
     """Register a Proof of Invention: multipart POST to
     $MOLECULE_CLIENT_URL/api/v1/inventions (field name 'files', Bearer
     $POI_API_KEY). Returns the full response plus extracted
-    {poiTo, poiData, merkleRoot}."""
+    {poiTo, poiData, merkleRoot}. (No wallet involved; the returned poiTo/poiData
+    is the on-chain anchor tx you then prepare_transaction + sign/send yourself.)"""
     creds = require_env("POI_API_KEY")
     base = clientUrl or env("MOLECULE_CLIENT_URL")
     if not base:
@@ -1002,35 +793,16 @@ def labs_graphql(
     """POST a GraphQL query/mutation to $MOLECULE_LABS_URL. auth='api-key' sends
     x-api-key:$MOLECULE_API_KEY (aura mint flow). auth='service-token' sends
     x-service-token:$MOLECULE_SERVICE_TOKEN + x-wallet-address:$EVM_WALLET_ADDRESS
-    (private/encrypted upload). auth='none' for public sign-in queries. Returns {data, errors}.
-    Do NOT use for generateDataEncryptionKey/decryptDataKey — use
-    labs_generate_dek/labs_decrypt_dek so the plaintext DEK stays inside the server."""
-    # Same fail-closed finalize guard as x402_pay, in case the finalize is ever
-    # routed through the direct Labs endpoint instead of the x402 gateway.
+    (private/encrypted upload). auth='none' for public queries. Returns {data, errors}.
+    This is non-signing HTTP only — it does not sign or send transactions. Do NOT use
+    for generateDataEncryptionKey/decryptDataKey — use labs_generate_dek/labs_decrypt_dek
+    so the plaintext DEK stays inside the server. For PAID mutations use
+    x402_prepare/x402_submit (the caller signs)."""
+    # Same fail-closed finalize guard as x402, in case a finalize is ever routed
+    # through the direct Labs endpoint instead of the x402 gateway.
     if "finishCreateOrUpdateFileV2" in query:
         assert_confidential_finalize_ok(variables)
     return dump(labs_graphql_call(query, variables or {}, auth, labsUrl))
-
-
-@mcp.tool()
-def x402_pay(
-    mutation: str,
-    query: str,
-    variables: dict | None = None,
-    gatewayUrl: str | None = None,
-    walletId: str | None = None,
-) -> str:
-    """Run the entire x402 payment flow (P1–P7) for ONE whitelisted mutation in a
-    single call: send -> decode the payment-required challenge -> sign the EIP-712
-    TransferWithAuthorization with the Privy wallet -> retry with PAYMENT-SIGNATURE.
-    The single top-level GraphQL field in `query` MUST equal `mutation` (the
-    gateway's validateMutationQuery enforces this). Returns {data, errors, settlement}.
-    Whitelisted mutations (the V2 surface, from x402-gateway-lambda/mutations.ts):
-    initiateCreateOrUpdateFileV2, finishCreateOrUpdateFileV2, createAnnouncementV2,
-    createProject, addProjectOwner, generateDataEncryptionKey, decryptDataKey (any
-    other mutation 400s with 'not enabled for x402 gateway'). All data-room args are
-    keyed on ipnftUid ({contractAddress}_{tokenId}) — NOT oclId."""
-    return dump(run_x402_pay(mutation, query, variables, gatewayUrl, walletId))
 
 
 @mcp.tool()
@@ -1042,8 +814,8 @@ def s3_upload(
     headers: dict | None = None,
 ) -> str:
     """PUT (or POST) a local file to a presigned S3 URL, applying all headers
-    returned by the initiate step plus Content-Type. NO x402 payment. Used for the
-    cover image, public file upload (Step B), and the encrypted ciphertext (E3).
+    returned by the initiate step plus Content-Type. No wallet / no payment. Used for
+    the cover image, public file upload (Step B), and the encrypted ciphertext (E3).
     Returns {status, ok}."""
     data = Path(filePath).read_bytes()
     assert_not_confidential_plaintext(filePath, data)
@@ -1059,32 +831,23 @@ def s3_upload(
 
 @mcp.tool()
 def labs_generate_dek(
-    transport: Literal["direct", "x402"] = "direct",
     auth: LabsAuth = "service-token",
-    gatewayUrl: str | None = None,
     labsUrl: str | None = None,
-    walletId: str | None = None,
 ) -> str:
-    """Call generateDataEncryptionKey and KEEP the plaintext DEK inside this
-    server. Returns {encryptedDek, encryptionSystem, dekHandle} — pass dekHandle to
-    encrypt_file. The plaintext DEK is NEVER returned to the agent. transport='direct'
-    (default, service-token) is the recommended path — it needs no payment and keeps
-    the DEK in-process. generateDataEncryptionKey IS now x402-whitelisted (mutations.ts),
-    so transport='x402' also works, but prefer 'direct' for DEK generation."""
+    """Call generateDataEncryptionKey (direct, service-token) and KEEP the plaintext
+    DEK inside this server. Returns {encryptedDek, encryptionSystem, dekHandle} — pass
+    dekHandle to encrypt_file. The plaintext DEK is NEVER returned to the agent. This
+    is a service-token HTTP call (no wallet signature, no payment); the DEK stays
+    in-process. (generateDataEncryptionKey is also x402-whitelisted, but keep it direct
+    here so no payment is spent on a key fetch.)"""
     query = (
         "mutation GenerateDataEncryptionKey { generateDataEncryptionKey { isSuccess "
         "plaintextDEK encryptedDek encryptionSystem error { message code retryable } } }"
     )
-    if transport == "x402":
-        r = run_x402_pay("generateDataEncryptionKey", query, {}, gatewayUrl, walletId)
-        if r.get("errors"):
-            raise ToolError(f"generateDataEncryptionKey errors: {json.dumps(r['errors'])[:400]}")
-        result = (r.get("data") or {}).get("generateDataEncryptionKey")
-    else:
-        r = labs_graphql_call(query, {}, auth, labsUrl)
-        if r.get("errors"):
-            raise ToolError(f"generateDataEncryptionKey errors: {json.dumps(r['errors'])[:400]}")
-        result = (r.get("data") or {}).get("generateDataEncryptionKey")
+    r = labs_graphql_call(query, {}, auth, labsUrl)
+    if r.get("errors"):
+        raise ToolError(f"generateDataEncryptionKey errors: {json.dumps(r['errors'])[:400]}")
+    result = (r.get("data") or {}).get("generateDataEncryptionKey")
     if not result or not result.get("isSuccess") or not result.get("plaintextDEK"):
         raise ToolError(
             f"generateDataEncryptionKey did not succeed: {json.dumps((result or {}).get('error') or result)[:400]}"
@@ -1105,25 +868,22 @@ def labs_decrypt_dek(
     ipnftUid: str | None = None,
     tokenUri: str | None = None,
     agreementUrl: str | None = None,
-    transport: Literal["direct", "x402"] = "direct",
     auth: LabsAuth = "service-token",
-    gatewayUrl: str | None = None,
     labsUrl: str | None = None,
-    walletId: str | None = None,
     serviceToken: str | None = None,
     walletAddress: str | None = None,
 ) -> str:
-    """Call decryptDataKey (the backend evaluates on-chain access conditions for
-    the caller) and KEEP the plaintext DEK inside this server. Returns
-    {iv, dekHandle, message} — pass dekHandle to decrypt_file.
+    """Call decryptDataKey (direct, service-token — the backend evaluates the
+    on-chain access conditions for the caller) and KEEP the plaintext DEK inside this
+    server. Returns {iv, dekHandle, message} — pass dekHandle to decrypt_file.
 
     The decryptDataKey mutation (encryption.graphql) accepts ipnftUid + filePath
     (a data-room file, format {contractAddress}_{tokenId}) or tokenUri + agreementUrl
     (an IPFS agreement). For a data-room file pass ipnftUid + filePath. ACCESS_DENIED
-    means the caller wallet fails the on-chain condition; LEGACY_ENCRYPTION means the
-    file predates the envelope flow. decryptDataKey IS x402-whitelisted, but
-    transport='direct' (service-token) is recommended so the plaintext DEK stays
-    in-process and no payment is needed."""
+    means the caller (the service token's adminAddress) fails the on-chain condition;
+    LEGACY_ENCRYPTION means the file predates the envelope flow. Pass serviceToken /
+    walletAddress to act as a specific authorized wallet without swapping env. This is
+    a service-token HTTP call — no wallet signature, no payment."""
     if not ipnftUid and not tokenUri:
         raise ToolError("Provide ipnftUid (data-room file) or tokenUri (IPFS agreement).")
     arg_decls, arg_uses, variables = [], [], {}
@@ -1147,15 +907,10 @@ def labs_decrypt_dek(
         f"mutation DecryptDataKey({', '.join(arg_decls)}) {{ decryptDataKey({', '.join(arg_uses)}) "
         "{ isSuccess plaintextDEK iv message error { message code retryable } } }"
     )
-    if transport == "x402":
-        r = run_x402_pay("decryptDataKey", query, variables, gatewayUrl, walletId)
-        result = (r.get("data") or {}).get("decryptDataKey")
-    else:
-        r = labs_graphql_call(
-            query, variables, auth, labsUrl,
-            service_token=serviceToken, wallet_address=walletAddress,
-        )
-        result = (r.get("data") or {}).get("decryptDataKey")
+    r = labs_graphql_call(
+        query, variables, auth, labsUrl, service_token=serviceToken, wallet_address=walletAddress
+    )
+    result = (r.get("data") or {}).get("decryptDataKey")
     if not result or not result.get("isSuccess") or not result.get("plaintextDEK"):
         # Surface backend status verbatim (ACCESS_DENIED / LEGACY_ENCRYPTION).
         return dump(
@@ -1169,7 +924,7 @@ def labs_decrypt_dek(
     return dump({"iv": result.get("iv"), "dekHandle": handle, "message": result.get("message")})
 
 
-# ---- Crypto / encoding ---------------------------------------------------
+# ---- Crypto / encoding (pure compute) ------------------------------------
 
 
 @mcp.tool()
@@ -1216,12 +971,13 @@ def hex_to_uint256(hex: str) -> str:
 
 @mcp.tool()
 def abi_encode(functionSignature: str, args: list) -> str:
-    """ABI-encode a Solidity function call to calldata. functionSignature is e.g.
-    'mintReservation(address,uint256,string,string,bytes)' or
-    'safeTransferFrom(address,address,uint256)'. Pass args in order: uint*/int* as
+    """ABI-encode a Solidity function call to calldata (pure compute — no signing).
+    functionSignature is e.g. 'mintReservation(address,uint256,string,string,bytes)'
+    or 'safeTransferFrom(address,address,uint256)'. Pass args in order: uint*/int* as
     decimal strings or ints; bytes/bytesN as 0x-prefixed hex (a non-0x string is
     rejected, NOT silently UTF-8 encoded); address as 0x + 40 hex; string as text.
-    Returns {calldata}."""
+    Returns {calldata} — pass it as `data` to prepare_transaction, then sign/send with
+    your wallet."""
     return dump({"calldata": abi_encode_impl(functionSignature, args)})
 
 
@@ -1257,23 +1013,24 @@ def build_access_conditions(
     return dump({"conditions": conditions, "json": json.dumps(conditions, separators=(",", ":"))})
 
 
-# ---- service token bootstrap --------------------------------------------
+# ---- Service token: PREPARE the sign-in message, then EXCHANGE the caller's
+#      signature for the JWT. The server signs nothing. ---------------------
 
 
 @mcp.tool()
-def issue_service_token(
-    serviceName: str = "data-sync-service",
-    expiresIn: str = "720h",
+def service_signin_message(
     walletAddress: str | None = None,
-    walletId: str | None = None,
+    serviceName: str = "data-sync-service",
     labsUrl: str | None = None,
 ) -> str:
-    """Issue a Labs JWT service token (off-chain credential — NOT an on-chain mint):
-    getServiceSignInMessage -> personal_sign (Privy) -> generateServiceToken. Returns
-    {token, tokenId, expiresAt} — set token as MOLECULE_SERVICE_TOKEN in
-    settings.local.json. The token is a secret; this server never logs it. Prefer
-    pre-setting MOLECULE_SERVICE_TOKEN over issuing per run."""
-    addr = walletAddress or get_wallet_address(walletId)
+    """Step 1/2 of issuing a Labs JWT service token (off-chain credential — NOT an
+    on-chain mint). Fetch getServiceSignInMessage for the wallet that will own the
+    token's access (its address becomes the token's adminAddress, which the decrypt
+    evaluator substitutes into isAuthorizedSignerForIpnft). Returns {message,
+    walletAddress, serviceName}. Have YOUR wallet personal_sign (EIP-191) the exact
+    `message` (Privy agentic wallet recommended; or any key bound to walletAddress),
+    then call service_token_create with that signature. This server does NOT sign."""
+    addr = resolve_address(walletAddress)
     msg = labs_graphql_call(
         "query GetServiceSignInMessage($walletAddress: String!, $serviceName: String!) "
         "{ getServiceSignInMessage(walletAddress: $walletAddress, serviceName: $serviceName) { message } }",
@@ -1283,73 +1040,60 @@ def issue_service_token(
     )
     message = ((msg.get("data") or {}).get("getServiceSignInMessage") or {}).get("message")
     if not message:
-        raise ToolError(f"getServiceSignInMessage returned no message: {json.dumps(msg.get('errors') or msg)[:300]}")
-    wid = resolve_wallet_id(walletId)
-    sig = privy_rpc(wid, {"method": "personal_sign", "params": {"message": message, "encoding": "utf-8"}})
-    message_signature = (sig or {}).get("data", {}).get("signature")
-    if not message_signature:
-        raise ToolError("Privy did not return a signature for the sign-in message.")
+        raise ToolError(
+            f"getServiceSignInMessage returned no message: {json.dumps(msg.get('errors') or msg)[:300]}"
+        )
+    return dump(
+        {
+            "message": message,
+            "walletAddress": addr,
+            "serviceName": serviceName,
+            "next": (
+                "personal_sign this exact message with YOUR wallet (the one bound to "
+                f"{addr}), then call service_token_create(walletAddress, messageSignature)."
+            ),
+        }
+    )
+
+
+@mcp.tool()
+def service_token_create(
+    walletAddress: str,
+    messageSignature: str,
+    serviceName: str = "data-sync-service",
+    expiresIn: str = "720h",
+    labsUrl: str | None = None,
+) -> str:
+    """Step 2/2 of issuing a Labs JWT service token: exchange the caller's
+    personal_sign signature of the service_signin_message for the token via
+    generateServiceToken. The backend verifies the signature against walletAddress and
+    binds the token's adminAddress to it. Returns {token, tokenId, expiresAt} — set
+    `token` as MOLECULE_SERVICE_TOKEN (secret; this server never logs it), or pass it
+    per-call via labs_decrypt_dek(serviceToken=...) to act as that wallet. This server
+    does NOT sign — `messageSignature` must come from the caller's wallet."""
     tok = labs_graphql_call(
         "mutation GenerateServiceToken($serviceName: String!, $expiresIn: String!, $walletAddress: String, $messageSignature: String) "
         "{ generateServiceToken(serviceName: $serviceName, expiresIn: $expiresIn, walletAddress: $walletAddress, messageSignature: $messageSignature) "
         "{ token tokenId serviceName expiresAt isSuccess message } }",
-        {"serviceName": serviceName, "expiresIn": expiresIn, "walletAddress": addr, "messageSignature": message_signature},
+        {
+            "serviceName": serviceName,
+            "expiresIn": expiresIn,
+            "walletAddress": walletAddress,
+            "messageSignature": messageSignature,
+        },
         "none",
         labsUrl,
     )
     result = (tok.get("data") or {}).get("generateServiceToken")
     if not result or not result.get("isSuccess") or not result.get("token"):
         raise ToolError(f"generateServiceToken failed: {json.dumps(result or tok.get('errors'))[:300]}")
-    return dump({"token": result.get("token"), "tokenId": result.get("tokenId"), "expiresAt": result.get("expiresAt")})
-
-
-@mcp.tool()
-def issue_owner_service_token(
-    ownerPrivateKey: str | None = None,
-    serviceName: str = "owner-data-access",
-    expiresIn: str = "720h",
-    labsUrl: str | None = None,
-) -> str:
-    """Issue a Labs JWT service token (off-chain credential — NOT an on-chain mint)
-    bound to the OWNER (user's personal) wallet by signing getServiceSignInMessage
-    with the owner's raw private key (WALLET_PRIVATE_KEY by default). Unlike
-    issue_service_token (which signs via the Privy AGENT wallet), this binds the
-    token to the owner EOA — required because
-    decryptDataKey gates on the service token's adminAddress. Pass the returned
-    `token` to labs_decrypt_dek(serviceToken=...) to decrypt as the owner. Returns
-    {token, tokenId, address, expiresAt}. The private key never leaves this process."""
-    try:
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
-    except ImportError as e:  # pragma: no cover
-        raise ToolError(f"eth-account is required for owner-key signing: {e}")
-    pk = ownerPrivateKey or env("WALLET_PRIVATE_KEY")
-    if not pk:
-        raise ToolError("Provide ownerPrivateKey or set WALLET_PRIVATE_KEY.")
-    acct = Account.from_key(pk)
-    msg_q = ("query GetServiceSignInMessage($w: String!, $s: String!) { "
-             "getServiceSignInMessage(walletAddress: $w, serviceName: $s) { message } }")
-    m = labs_graphql_call(msg_q, {"w": acct.address, "s": serviceName}, "api-key", labsUrl)
-    message = (((m.get("data") or {}).get("getServiceSignInMessage")) or {}).get("message")
-    if not message:
-        raise ToolError(f"getServiceSignInMessage failed: {json.dumps(m.get('errors') or m)[:300]}")
-    signature = Account.sign_message(encode_defunct(text=message), pk).signature.hex()
-    signature = signature if signature.startswith("0x") else "0x" + signature
-    tok_q = ("mutation GenerateServiceToken($s: String!, $e: String, $w: String, $m: String) { "
-             "generateServiceToken(serviceName: $s, expiresIn: $e, walletAddress: $w, messageSignature: $m) "
-             "{ token tokenId expiresAt isSuccess message } }")
-    t = labs_graphql_call(
-        tok_q, {"s": serviceName, "e": expiresIn, "w": acct.address, "m": signature}, "api-key", labsUrl
+    return dump(
+        {
+            "token": result.get("token"),
+            "tokenId": result.get("tokenId"),
+            "expiresAt": result.get("expiresAt"),
+        }
     )
-    res = ((t.get("data") or {}).get("generateServiceToken")) or {}
-    if not res.get("isSuccess") or not res.get("token"):
-        raise ToolError(f"generateServiceToken failed: {json.dumps(res or t.get('errors'))[:400]}")
-    return dump({
-        "token": res.get("token"),
-        "tokenId": res.get("tokenId"),
-        "address": acct.address,
-        "expiresAt": res.get("expiresAt"),
-    })
 
 
 # --------------------------------------------------------------------------
@@ -1358,7 +1102,7 @@ def issue_owner_service_token(
 
 
 def main() -> None:
-    log("molecule-mcp ready (stdio)")
+    log("molecule-mcp ready (stdio) — custody-free: crafts payloads, never signs")
     mcp.run()
 
 

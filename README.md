@@ -8,11 +8,18 @@ server alone).
   creation → data-room file upload → announcement → transfer. V2 surface, keyed on `ipnftUid`. The file
   upload (Phase 4) is the only branch: choose **public** (plaintext) or **private** (client-side
   AES-256-GCM envelope-encrypted, access-controlled) — **x402 pays per call either way**.
-- **`privy-agentic-wallets`** — helper for creating/managing the Privy server wallet (with a policy) that
-  signs payments and on-chain transactions. Run once if `PRIVY_WALLET_ID` is unset.
-- **`molecule` MCP server** (`mcp/server.py`, Python/FastMCP, stdio) — Privy wallet ops, POI, Labs
-  GraphQL, the full x402 payment flow, S3 upload, AES-256-GCM envelope crypto, ABI encoding, on-chain
-  access conditions (`isAuthorizedSignerForIpnft`).
+- **`privy-agentic-wallets`** — the **recommended** way to provision the wallet that signs this molecule:
+  a policy-guarded Privy server wallet (no user interaction, ideal for autonomous agents). Optional — you
+  can bring any key you control instead — but it is the first option we recommend.
+- **`molecule` MCP server** (`mcp/server.py`, Python/FastMCP, stdio) — **custody-free**: it *crafts* the
+  requests/payloads (POI, Labs GraphQL, **x402 prepare/submit**, S3 upload, AES-256-GCM envelope crypto,
+  ABI encoding, on-chain access conditions, service-token sign-in) and runs only the non-signing HTTP
+  around them. It **never holds a key, signs, or broadcasts** — **your wallet** does that.
+
+> **The MCP holds no keys.** Signing and broadcasting are the caller's job, done by your wallet — a Privy
+> agentic wallet (recommended) or any key you control. See
+> [`skills/aura-orchestrator/references/wallet-signing.md`](skills/aura-orchestrator/references/wallet-signing.md)
+> for ready-to-use signing snippets (Privy first, then viem / ethers / eth-account).
 
 > **The MCP server is the portable core** — both harnesses speak MCP. Skills (`SKILL.md`) are a shared
 > standard both now read. Only the *plugin manifest* differs per harness, so this package ships both
@@ -42,12 +49,14 @@ The MCP server runs via **`uv run mcp/server.py`**, which reads the PEP 723 inli
 
 ## Environment variables
 
-The server reads all config/secrets from the environment (never from tool args). Provide them however
-your harness injects env into MCP subprocesses. Non-secrets: `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
+The server reads all config from the environment (never from tool args), and it reads **no wallet
+credentials** — it holds no private key. Non-secrets: `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
 `X402_GATEWAY_URL`, `ACCESS_RESOLVER_ADDRESS`, `IPNFT_CONTRACT_ADDRESS`, `CHAIN_ID`, `ENVIRONMENT`,
-`EVM_WALLET_ADDRESS`, `EXPERIMENT_COST_CENTS`, `IPNFT_UID`. Secrets: `PRIVY_APP_ID`, `PRIVY_APP_SECRET`,
-`PRIVY_WALLET_ID`, `POI_API_KEY`, `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`. See `mcp/README.md` for
-the per-tool breakdown.
+`EVM_WALLET_ADDRESS` (your operating wallet's **public** address), `EXPERIMENT_COST_CENTS`. Secrets:
+`POI_API_KEY`, `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`. Your **wallet** credentials — a Privy
+`PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` (optional), or your own private key — belong to
+your signer setup, **NOT** to the molecule MCP; keep them wherever your wallet tooling reads them. See
+`mcp/README.md` for the per-tool breakdown.
 
 ---
 
@@ -83,15 +92,14 @@ MOLECULE_LABS_URL = "https://migration.graphql.api.molecule.xyz/graphql"
 X402_GATEWAY_URL  = "https://…"
 CHAIN_ID          = "84532"
 ENVIRONMENT       = "migration"
-EVM_WALLET_ADDRESS = "0x…"
+EVM_WALLET_ADDRESS = "0x…"        # your operating wallet's PUBLIC address — no private key here
 ACCESS_RESOLVER_ADDRESS = "0x…"
-# secrets:
-PRIVY_APP_ID = "…"
-PRIVY_APP_SECRET = "…"
-PRIVY_WALLET_ID = "…"
+# secrets (NOT wallet keys — the MCP never signs):
 POI_API_KEY = "…"
 MOLECULE_API_KEY = "…"
 MOLECULE_SERVICE_TOKEN = "…"
+# Your WALLET credentials (a Privy PRIVY_APP_ID/PRIVY_APP_SECRET/PRIVY_WALLET_ID — optional — or your
+# own private key) live with YOUR signer/wallet tooling, NOT in the molecule MCP env.
 ```
 or, equivalently: `codex mcp add molecule --env CHAIN_ID=84532 --env … -- uv run /abs/path/to/molecule-plugin/mcp/server.py`
 
@@ -119,13 +127,16 @@ order; this is the cross-skill map.
 
 1. **Env + MCP.** Install `uv`, register the plugin (Claude) or MCP server (Codex), and set the env vars
    above. Pick the surface with `MOLECULE_LABS_URL` / `X402_GATEWAY_URL` / `CHAIN_ID` / `ENVIRONMENT`.
-2. **Wallet** → run **`privy-agentic-wallets`** *only if* `PRIVY_WALLET_ID` is unset. It creates a Privy
-   server wallet **with a policy** (single-chain + per-tx value cap); set the returned `PRIVY_WALLET_ID`.
-   Then **fund** that wallet: USDC on Base (x402 pays per call) + native gas on the mint chain.
+2. **Wallet (your signer).** Provision the wallet that will sign — **recommended: a Privy agentic wallet**
+   via the **`privy-agentic-wallets`** skill (creates a policy-guarded server wallet); or bring any key you
+   control. Put its **public** address in `EVM_WALLET_ADDRESS`. Then **fund** it: USDC on Base (x402 pays
+   per call) + native gas on the mint chain. The MCP never sees the key — see
+   [`skills/aura-orchestrator/references/wallet-signing.md`](skills/aura-orchestrator/references/wallet-signing.md).
 3. **Service token** (private uploads only) → ensure `MOLECULE_SERVICE_TOKEN` is set, or issue one with the
-   MCP `issue_service_token` tool. This is an **off-chain JWT** (issued by `generateServiceToken` after a
-   wallet signature — *not* an on-chain mint). The Phase 4 **private** variant uses it for the direct DEK
-   calls (`labs_generate_dek` / `labs_decrypt_dek`). Not needed for public uploads.
+   custody-free flow: `service_signin_message` → **sign the message with your wallet** → `service_token_create`.
+   This is an **off-chain JWT** (`generateServiceToken` verifies your signature — *not* an on-chain mint).
+   The Phase 4 **private** variant uses it for the direct DEK calls (`labs_generate_dek` / `labs_decrypt_dek`).
+   Not needed for public uploads.
 
 ### Step 1 — Run `aura-orchestrator`, choosing the upload visibility
 
@@ -160,21 +171,22 @@ Every phase consumes the previous phase's output (`reservationId` → `ipnftUid`
 Run these **instead of** Phase 4 Steps A–C when the upload visibility is **private**:
 
 ```
-E0  labs_generate_dek (direct)        → encryptedDek, dekHandle      [no payment]
-E1  encrypt_file                      → iv, contentHash, cipherBytes
-E2  x402_pay initiateCreateOrUpdateFileV2   → uploadToken, uploadUrl  [PAID]
+E0  labs_generate_dek (service-token)  → encryptedDek, dekHandle      [no payment]
+E1  encrypt_file                       → iv, contentHash, cipherBytes
+E2  x402 initiateCreateOrUpdateFileV2 (prepare → sign → submit)  → uploadToken, uploadUrl   [PAID]
 E3  s3_upload (the .enc ciphertext)                                   [no payment]
 E4  build_access_conditions (ipnft-signer, reservationId = tokenId)  → json
-E5  x402_pay finishCreateOrUpdateFileV2 (+ encryptionMetadata)        [PAID]
+E5  x402 finishCreateOrUpdateFileV2 (+ encryptionMetadata, prepare → sign → submit)         [PAID]
 E6  labs_decrypt_dek (ipnftUid+filePath) → decrypt_file → verify SHA-256   [optional, no payment]
 ```
 `contentLength` in E2 is the **ciphertext** size (`cipherBytes` from E1). The plaintext DEK never leaves
-the MCP — only the opaque `dekHandle` is passed between E0→E1 and E6.
+the MCP — only the opaque `dekHandle` is passed between E0→E1 and E6. The two **x402 paid** steps are
+each *prepare → sign with your wallet → submit* (the MCP never signs).
 
 ## ⚠️ Running cost
 
-`aura-orchestrator` Phases 3–6 perform **paid x402 mutations — real USDC on Base per call** — and
-on-chain transactions (mint/transfer). They need a funded Privy wallet and a valid service token / API
-key (the **private** upload variant also needs `MOLECULE_SERVICE_TOKEN`). For a no-spend smoke, use
-only the compute/direct tools (`encrypt_file`/`decrypt_file`, `build_access_conditions`, `sha256_file`;
-`labs_generate_dek` needs only a service token, no payment).
+`aura-orchestrator` Phases 3–6 prepare **paid x402 mutations — real USDC on Base per call** — and
+on-chain transactions (mint/transfer) that you must sign and broadcast using a wallet provider of your choice running on a funded account (e.g. a Privy agentic wallet or your own keypair) and a valid service token / API key (the
+**private** upload variant also needs a `MOLECULE_SERVICE_TOKEN`). For no-spend smoke testing, use only the
+compute tools (`prepare_transaction`, `x402_prepare` stops before you sign, `encrypt_file`/`decrypt_file`,
+`build_access_conditions`, `sha256_file`; `labs_generate_dek` needs only a service token, no payment).

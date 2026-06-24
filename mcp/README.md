@@ -1,11 +1,16 @@
 # molecule-mcp
 
 A single **stdio MCP server** that backs the [`aura-orchestrator`](../aura-orchestrator/SKILL.md)
-skill (POI → mint → project → public *or* private/encrypted data-room upload → announce → transfer)
-and the [`privy-agentic-wallets`](../privy-agentic-wallets/SKILL.md) helper. Every `curl` /
-`http_request` / `node -e` step in those skills is now a typed MCP tool, so the agent calls **one
-tool per operation**
-instead of hand-assembling shell commands, base64 dances, and EIP-712 payloads.
+skill (POI → mint → project → public *or* private/encrypted data-room upload → announce → transfer).
+Every `curl` / `http_request` / `node -e` *non-signing* step in that skill is a typed MCP tool, so the
+agent calls **one tool per operation** instead of hand-assembling shell commands and base64 dances.
+
+**Custody-free by design.** This server **never holds a private key, signs a message, or broadcasts a
+transaction.** It *crafts* the requests/payloads the molecule needs (transactions, EIP-712 typed-data,
+GraphQL, x402 challenges, encryption) and runs only the non-signing HTTP around them. Every
+wallet-dependent step is handed back to the **caller's wallet** — a Privy agentic wallet (the recommended
+first option) or any key the caller controls — to sign/send; see
+[`../aura-orchestrator/references/wallet-signing.md`](../aura-orchestrator/references/wallet-signing.md).
 
 - **Language:** Python (FastMCP) — chosen over Bun/Node so the plugin runs under **any**
   MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter.
@@ -13,8 +18,8 @@ instead of hand-assembling shell commands, base64 dances, and EIP-712 payloads.
 - **Deps:** `mcp`, `httpx`, `cryptography`, `eth-abi`, `eth-utils`, `eth-hash[pycryptodome]`
 
 Nothing is ever written to **stdout** except the JSON-RPC protocol (FastMCP owns stdout); all
-diagnostics go to **stderr**. Secrets (`PRIVY_APP_SECRET`, the plaintext DEK, the service token,
-API keys) are never logged or returned to the caller.
+diagnostics go to **stderr**. The server holds **no wallet credentials**; the secrets it does read (the
+service token, API keys) and the in-process plaintext DEK are never logged or returned to the caller.
 
 ---
 
@@ -72,26 +77,28 @@ After registering, enable it in your harness (for Claude Code: add `"molecule"` 
 
 The server reads all configuration from **environment variables**, which the harness injects into
 the MCP subprocess (for Claude Code, from `.claude/settings.json` non-secrets and
-`.claude/settings.local.json` secrets). The skills therefore **never pass secrets as tool
-arguments** — only file paths, queries, addresses, and the ephemeral `dekHandle`.
+`.claude/settings.local.json` secrets). It reads **no wallet credentials** (no private key, no Privy
+secret) — those stay with the caller's wallet. The skill **never passes secrets as tool arguments** —
+only file paths, queries, public addresses, signatures the caller produced, and the ephemeral `dekHandle`.
 
 | Variable | Where | Used by |
 |----------|-------|---------|
 | `MOLECULE_CLIENT_URL` | settings.json | `poi_register` |
-| `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `issue_service_token` |
-| `X402_GATEWAY_URL` | settings.json | `x402_pay` |
+| `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `service_signin_message`, `service_token_create` |
+| `X402_GATEWAY_URL` | settings.json | `x402_prepare`, `x402_submit` |
 | `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions` |
 | `IPNFT_CONTRACT_ADDRESS` | settings.json | (skill body) |
-| `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `build_access_conditions` |
+| `CHAIN_ID` | settings.json | `prepare_transaction`, `build_access_conditions` |
 | `ENVIRONMENT` | settings.json | `build_access_conditions` (base vs baseSepolia) |
-| `EVM_WALLET_ADDRESS` | settings.json | wallet resolution + `x-wallet-address` |
+| `EVM_WALLET_ADDRESS` | settings.json | default signer **public address** (x402 `from`, `x-wallet-address`) |
 | `EXPERIMENT_COST_CENTS` | settings.json | (skill body) |
-| `PRIVY_APP_ID` | settings.local.json | all Privy tools (basic-auth user) |
-| `PRIVY_APP_SECRET` | settings.local.json | all Privy tools (basic-auth pass) |
-| `PRIVY_WALLET_ID` | settings.local.json | wallet that signs/sends |
 | `POI_API_KEY` | settings.local.json | `poi_register` |
 | `MOLECULE_API_KEY` | settings.local.json | `labs_graphql` (auth=`api-key`) |
 | `MOLECULE_SERVICE_TOKEN` | settings.local.json | `labs_graphql`/DEK tools (auth=`service-token`) |
+
+**Not read by this server:** your wallet credentials. A Privy `PRIVY_APP_ID` / `PRIVY_APP_SECRET` /
+`PRIVY_WALLET_ID` (recommended) or your own private key live with your **signer**, not here — the MCP
+only ever needs the **public** `EVM_WALLET_ADDRESS`.
 
 If a tool needs a variable that isn't set, it returns a clear error naming the missing
 variable(s) — it never guesses an endpoint or address.
@@ -100,38 +107,37 @@ variable(s) — it never guesses an endpoint or address.
 
 `.venv/bin/python smoke.py` lists all tools and exercises the pure-compute ones — no network or
 secrets required. It regression-checks `hex_to_uint256` and `abi_encode` against known-good values,
-confirms `abi_encode` rejects non-`0x` bytes, builds an `ipnft-signer` access condition, and
-round-trips AES-256-GCM encrypt/decrypt.
+confirms `abi_encode` rejects non-`0x` bytes, builds an `ipnft-signer` access condition, validates
+`prepare_transaction` normalization, and round-trips AES-256-GCM encrypt/decrypt.
 
 ---
 
 ## Tools
 
-### Privy (wallet management, signing, sending)
+### Wallet handoff (the MCP prepares; the caller's wallet signs/sends)
 
-| Tool | Replaces | Returns |
-|------|----------|---------|
-| `privy_get_wallet_address` | aura `get_wallet_address`; x402 "resolve wallet" curl | `{ address, walletId }` |
-| `privy_list_wallets` | aura Step 0b curl | wallet list |
-| `privy_create_policy` | aura Step 0c curl | `{ policyId }` |
-| `privy_create_wallet` | aura Step 0d curl | `{ walletId, address }` |
-| `privy_sign_message` | aura `sign_message` (terms); service-token sign-in | `{ signature }` |
-| `privy_sign_typed_data` | ad-hoc EIP-712 (x402 does this internally) | `{ signature }` |
-| `privy_send_transaction` | aura `sign_and_send_transaction` (POI anchor, mint, transfer) | `{ txHash }` |
+The server signs nothing — these tools craft what the caller signs/sends and accept the result back.
 
-### Molecule HTTP
+| Tool | Crafts / does | Returns |
+|------|---------------|---------|
+| `prepare_transaction` | normalize a tx request (POI anchor, mint, transfer) for the caller to sign + broadcast | `{ transaction:{to,data,value,valueWei,chainId,caip2}, note }` |
+| `x402_prepare` | fetch the 402 challenge + build the EIP-712 the caller signs | `{ prepared:{endpoint,query,variables,accepted,resource,authorization,typedData} }` |
+| `x402_submit` | post the caller's signed x402 payment (does NOT sign) | `{ data, errors, settlement }` |
+
+`x402_prepare` sends the unpaid request, decodes the `payment-required` challenge, and builds the EIP-712
+`TransferWithAuthorization` (standard camelCase `primaryType`) with `from = walletAddress` — then stops.
+**The caller signs `prepared.typedData` with their own wallet** (Privy: remap `primaryType`→`primary_type`;
+own key: sign as-is) and calls `x402_submit(prepared, signature)`, which base64-encodes the payment payload
+and retries with the `PAYMENT-SIGNATURE` header. The single top-level GraphQL field in `query` **must
+equal** `mutation`.
+
+### Molecule HTTP (non-signing)
 
 | Tool | Replaces | Returns |
 |------|----------|---------|
 | `poi_register` | aura Phase 1 POI curl/http_request | `{ poiTo, poiData, merkleRoot, response }` |
-| `labs_graphql` | aura Steps 2,3,5,6,8 GraphQL; public sign-in queries | `{ data, errors }` |
-| `x402_pay` | the **entire** P1–P7 flow for one mutation | `{ data, errors, settlement }` |
+| `labs_graphql` | aura Steps 2,3,5,6,8 GraphQL; public queries | `{ data, errors }` |
 | `s3_upload` | aura Step 4/B image+file PUT; x402 E3 ciphertext PUT | `{ status, ok }` |
-
-`x402_pay` sends the unpaid request, decodes the `payment-required` challenge, signs the EIP-712
-`TransferWithAuthorization` with the Privy wallet (standard camelCase `primaryType`), builds and
-base64-encodes the payment payload, and retries with the `PAYMENT-SIGNATURE` header — all
-internally. The single top-level GraphQL field in `query` **must equal** `mutation`.
 
 ### DEK-aware (the plaintext DEK never leaves the server)
 
@@ -144,9 +150,8 @@ These wrap the DEK mutations and stash the **plaintext DEK in server memory**, r
 `dekHandle` instead. The agent passes the handle to `encrypt_file` / `decrypt_file`, so the
 one-shot secret DEK never enters the conversation, a file, or a log. `labs_decrypt_dek` takes
 `ipnftUid`+`filePath` (data-room file, `{contractAddress}_{tokenId}`) or `tokenUri`+`agreementUrl`
-(IPFS agreement) — matching `encryption.graphql`. Both DEK mutations are now x402-whitelisted, but
-the tools default to `transport='direct'` (service-token) so the plaintext DEK stays in-process and
-no payment is needed.
+(IPFS agreement) — matching `encryption.graphql`. Both use `auth='service-token'` (a JWT, not a wallet
+signature), so the plaintext DEK stays in-process and no x402 payment is needed.
 
 ### Crypto / encoding (pure compute)
 
@@ -177,20 +182,23 @@ not a guarantee, so the server enforces it at the tool boundary, **non-overridab
   file the agent encrypted can never reach S3, regardless of `accessLevel` or which upload path the
   agent takes. Uploading the `.enc` ciphertext, the cover image, or a genuinely-public file is
   unaffected (different bytes / never encrypted).
-- `build_access_conditions` records the IP-NFT **tokenId**. `x402_pay` then **refuses**
-  `finishCreateOrUpdateFileV2` for that tokenId when `accessLevel` is `PUBLIC` or `encryptionMetadata`
-  is missing — a molecule whose access conditions were built can only be finalized non-PUBLIC + encrypted.
+- `build_access_conditions` records the IP-NFT **tokenId**. `x402_prepare` / `x402_submit` (and the direct
+  `labs_graphql` path) then **refuse** `finishCreateOrUpdateFileV2` for that tokenId when `accessLevel` is
+  `PUBLIC` or `encryptionMetadata` is missing — a molecule whose access conditions were built can only be
+  finalized non-PUBLIC + encrypted.
 
 The latch is process-local (cleared on subprocess restart, like the DEK store) and keyed on exact
 plaintext bytes + tokenId, so it has no false positives for legitimate public uploads or for a
 different molecule handled in the same session.
 
-### Bootstrap
+### Service token (off-chain JWT — the MCP prepares + exchanges; the caller signs)
 
-| Tool | Replaces | Returns |
-|------|----------|---------|
-| `issue_service_token` | issue an off-chain JWT service token bound to the Privy AGENT wallet (3-step flow) | `{ token, tokenId, expiresAt }` |
-| `issue_owner_service_token` | issue an off-chain JWT service token bound to the OWNER EOA (signs with `WALLET_PRIVATE_KEY`) | `{ token, tokenId, address, expiresAt }` |
+| Tool | Crafts / does | Returns |
+|------|---------------|---------|
+| `service_signin_message` | fetch `getServiceSignInMessage` for a wallet (its address → the token's `adminAddress`) | `{ message, walletAddress, serviceName }` |
+| `service_token_create` | exchange the caller's `personal_sign` of that message for the JWT via `generateServiceToken` | `{ token, tokenId, expiresAt }` |
+
+Between the two, **the caller `personal_sign`s the `message` with their own wallet** (eg Privy agent wallet, or their own key) — the MCP server itself never signs. Bind the token to whatever wallet is the IP-NFT's authorized signer.
 
 ---
 
@@ -198,10 +206,10 @@ different molecule handled in the same session.
 
 | Behavior | Replicated from |
 |----------|-----------------|
-| x402 challenge / payment header / `PAYMENT-SIGNATURE` | `desci-infra/lambda/x402-gateway-lambda/index.ts` |
+| x402 challenge decode / payment header / `PAYMENT-SIGNATURE` (caller signs) | `desci-infra/lambda/x402-gateway-lambda/index.ts` |
 | x402 mutation whitelist | `desci-infra/lambda/x402-gateway-lambda/mutations.ts` |
 | AES-256-GCM envelope (12-byte IV, appended tag, plaintext hash) | `desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts` |
 | `accessControlConditions` (`isAuthorizedSignerForIpnft`) | `desci-infra/lambda/common/utils/access-control-conditions.ts` + `desci-infra/bruno/desci-labs/v2/25-finishEncryptedFileUploadV2.bru` |
-| EIP-712 typed-data `primaryType` | `skills/privy-agentic-wallets/references/transactions.md` |
+| EIP-712 `TransferWithAuthorization` typed-data (built by `x402_prepare`, **signed by the caller's wallet**) | `skills/aura-orchestrator/references/wallet-signing.md` |
 | GraphQL field shapes / `EncryptionMetadataInput` / `decryptDataKey` args | `desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql` |
 | Request shapes & auth headers | `desci-infra/bruno/desci-labs/v2` + `desci-infra/bruno/service-auth` |
