@@ -238,7 +238,3 @@ Extended chains: `cosmos`, `stellar`, `sui`, `aptos`, `tron`, `bitcoin-segwit`, 
 - wallets.md — Wallet creation and management
 - policies.md — Policy rules and conditions
 - transactions.md — Transaction execution examples
-
-## Provenance
-
-You find the original copy of this skill at [Privy's github repository](https://github.com/privy-io/privy-agentic-wallets-skill/blob/main/SKILL.md)

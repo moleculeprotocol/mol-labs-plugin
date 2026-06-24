@@ -186,3 +186,10 @@ on-chain transactions (mint/transfer) that you must sign and broadcast using a w
 **private** upload variant also needs a `MOLECULE_SERVICE_TOKEN`). For no-spend smoke testing, use only the
 compute tools (`prepare_transaction`, `x402_prepare` stops before you sign, `encrypt_file`/`decrypt_file`,
 `build_access_conditions`, `sha256_file`; `labs_generate_dek` needs only a service token, no payment).
+
+## Privy Wallets Provenance
+
+We mostly copied over the original Privy skills. Here you find the originals:
+
+- [https://agents.privy.io/skill.md](the agent skill)
+- [Privy's github repository](https://github.com/privy-io/privy-agentic-wallets-skill/blob/main/SKILL.md)
