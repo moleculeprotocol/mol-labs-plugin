@@ -8,6 +8,7 @@
 #   "eth-abi>=5",
 #   "eth-utils>=4",
 #   "eth-hash[pycryptodome]>=0.5",
+#   "eth-account>=0.13",
 # ]
 # ///
 """molecule-mcp — stdio MCP server for the Molecule DeSci skills.
@@ -21,18 +22,11 @@ Written in Python (FastMCP) and run over stdio so it works under any
 MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter —
 no Bun/Node required.
 
-This server targets the **V2 GraphQL surface** (the one live on production), keyed on
-``ipnftUid`` (``{contractAddress}_{tokenId}``). The retired OCL surface (``oclId``,
-``initiateCreateOrUpdateFile``/``finishCreateOrUpdateFile``/``createAnnouncement``/``createLab``)
-is intentionally NOT supported here.
-
-Source-of-truth parity (these tools faithfully replicate the real backend):
-  - x402 payment flow ........ desci-infra/lambda/x402-gateway-lambda/index.ts
-  - x402 mutation whitelist .. desci-infra/lambda/x402-gateway-lambda/mutations.ts
-  - AES-256-GCM envelope ..... desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts
-  - access conditions ........ desci-infra/lambda/common/utils/access-control-conditions.ts
-  - GraphQL field shapes ..... desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql
-  - request shapes / auth .... desci-infra/bruno/desci-labs/v2 + desci-infra/bruno/service-auth
+This server targets the **OCL / V3 GraphQL surface** (the current production model),
+keyed on ``oclId`` (a bytes32 ``0x`` + 64 hex), on the OCL chain (Base / Base Sepolia).
+A lab is an On-Chain Lab: a LabNFT + its token-bound account (TBA). The legacy IP-NFT
+surface (``ipnftUid``, ``mintReservation``, ``isAuthorizedSignerForIpnft``, Proof-of-
+Invention) is intentionally NOT supported here — on mainnet there is no IP-NFT.
 
 Transport: stdio. NOTHING is written to stdout except the JSON-RPC protocol —
 FastMCP owns stdout; all diagnostics go to stderr (see ``log``). Secrets
@@ -55,8 +49,9 @@ from typing import Any, Literal
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from eth_abi import decode as abi_decode_values
 from eth_abi import encode as abi_encode_values
-from eth_utils import function_signature_to_4byte_selector
+from eth_utils import function_signature_to_4byte_selector, keccak
 
 from mcp.server.fastmcp import FastMCP
 
@@ -111,10 +106,126 @@ def require_env(*names: str) -> dict[str, str]:
         raise ToolError(
             "Missing required environment variable(s): "
             + ", ".join(missing)
-            + ". Set them in .claude/settings.json (non-secrets) or "
-            ".claude/settings.local.json (secrets), then restart."
+            + ". Set them in the project-base .claude/settings.json (non-secrets) or "
+            ".claude/settings.local.json (secrets), then reload the MCP (/mcp). "
+            "Run the config_doctor tool to see what is set and which file it loaded from."
         )
     return out
+
+
+# --------------------------------------------------------------------------
+# config bootstrap — load env from the PROJECT-BASE .claude, never global.
+#
+# A stdio MCP server only sees os.environ as injected by the launching harness.
+# When the active project root is a SUBDIRECTORY of where the workspace's
+# .claude/settings*.json live (here: launched from molecule-plugin/ while the
+# config — secrets included — sits one level up in molecule_core/.claude), the
+# harness injects nothing and every tool dies on "Missing required environment
+# variable(s)". So at import time we resolve ONE project base — the nearest
+# ancestor .claude dir (of CLAUDE_PLUGIN_ROOT / this file / the CWD) that
+# actually carries an `env` block — and load its settings.json + settings.local.json.
+# The user's global ~/.claude is deliberately EXCLUDED: config comes from the
+# project base you run in, not from global settings. Precedence:
+# real process env > base settings.local.json (secrets) > base settings.json.
+# We never overwrite a var already in the environment, and never log values.
+# --------------------------------------------------------------------------
+
+_PREEXISTING_ENV_KEYS: set[str] = set()  # keys present before bootstrap (harness-injected)
+_ENV_SOURCES: dict[str, str] = {}  # var -> file it was loaded from (bootstrapped vars only)
+_CONFIG_BASE: str | None = None  # the resolved project-base .claude dir
+_CONFIG_FILES_LOADED: list[str] = []  # settings files actually loaded from the base
+
+
+def _read_settings_env(path: Path) -> dict[str, str]:
+    """Return the non-empty `env` block of a .claude/settings*.json ({} if absent/empty/bad)."""
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # malformed JSON, permissions, …
+        log(f"[config] skipping unreadable {path}: {e}")
+        return {}
+    block = data.get("env") if isinstance(data, dict) else None
+    if isinstance(block, dict):
+        return {k: str(v) for k, v in block.items() if v is not None and v != ""}
+    return {}
+
+
+def _candidate_claude_dirs() -> list[Path]:
+    """Ancestor .claude dirs (nearest first) of the run dir / this file / CWD,
+    EXCLUDING the global ~/.claude — config must come from the project base."""
+    try:
+        home_claude: Path | None = (Path.home() / ".claude").resolve()
+    except Exception:
+        home_claude = None
+    starts: list[Path] = []
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root:
+        starts.append(Path(plugin_root))
+    for getter in (lambda: Path(__file__).resolve().parent, lambda: Path.cwd()):
+        try:
+            starts.append(getter())
+        except Exception:
+            pass
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for start in starts:
+        try:
+            chain = [start.resolve(), *start.resolve().parents]
+        except Exception:
+            continue
+        for d in chain:
+            cd = d / ".claude"
+            try:
+                rcd = cd.resolve()
+            except Exception:
+                continue
+            if rcd in seen:
+                continue
+            if home_claude is not None and rcd == home_claude:
+                continue  # never the global config
+            try:
+                if cd.is_dir():
+                    seen.add(rcd)
+                    out.append(cd)
+            except OSError:
+                pass
+    out.sort(key=lambda p: len(p.resolve().parts), reverse=True)  # nearest (deepest) first
+    return out
+
+
+def _bootstrap_env() -> None:
+    """Resolve the project base and fill os.environ from its .claude settings."""
+    global _CONFIG_BASE
+    _PREEXISTING_ENV_KEYS.update(os.environ.keys())
+    for cd in _candidate_claude_dirs():
+        local_env = _read_settings_env(cd / "settings.local.json")
+        shared_env = _read_settings_env(cd / "settings.json")
+        if not local_env and not shared_env:
+            continue  # not a config-bearing base; keep walking up
+        _CONFIG_BASE = str(cd)
+        filled: list[str] = []
+        # settings.local.json (secrets) wins over settings.json within the base;
+        # neither ever overwrites a var already set by the harness/process.
+        for fname, block in (("settings.local.json", local_env), ("settings.json", shared_env)):
+            if not block:
+                continue
+            _CONFIG_FILES_LOADED.append(str(cd / fname))
+            for k, v in block.items():
+                if k in os.environ:
+                    continue
+                os.environ[k] = v
+                _ENV_SOURCES[k] = str(cd / fname)
+                filled.append(k)
+        log(
+            f"[config] project base {cd}: loaded {len(filled)} env var(s)"
+            + (f" ({', '.join(sorted(filled))})" if filled else "")
+        )
+        return  # only the nearest config-bearing base is used
+    log("[config] no project-base .claude with an env block found (global ~/.claude excluded)")
+
+
+_bootstrap_env()
 
 
 # --------------------------------------------------------------------------
@@ -167,19 +278,45 @@ def resolve_wallet_id(explicit: str | None) -> str:
     return wid
 
 
-def get_wallet_address(wallet_id: str | None = None) -> str:
-    from_env = env("EVM_WALLET_ADDRESS")
-    if from_env:
-        return from_env
-    wid = resolve_wallet_id(wallet_id)
+# Cache the Privy wallet's on-chain address (the operating signer) per wallet id —
+# resolved via a Privy GET, so cache it to avoid an API round-trip on every call.
+_operating_address_cache: dict[str, str] = {}
+
+
+def _privy_wallet_address(wallet_id: str) -> str:
+    cached = _operating_address_cache.get(wallet_id)
+    if cached:
+        return cached
     auth, headers = _privy_auth()
-    resp = _client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=auth, headers=headers)
+    resp = _client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wallet_id}", auth=auth, headers=headers)
     j = _json_or_none(resp)
     if resp.status_code >= 400 or not (j and j.get("address")):
         raise ToolError(
             f"Could not resolve wallet address ({resp.status_code}): {resp.text[:300]}"
         )
+    _operating_address_cache[wallet_id] = j["address"]
     return j["address"]
+
+
+def get_wallet_address(wallet_id: str | None = None) -> str:
+    # Operating identity = the Privy wallet that actually SIGNS (mint, x402, uploads,
+    # the agent's service-token calls). Resolve its REAL on-chain address first, so the
+    # agent can differ from the owner/recipient EOA (EVM_WALLET_ADDRESS) — required for a
+    # genuine hand-off where the LabNFT is transferred to a distinct EOA that then
+    # decrypts. EVM_WALLET_ADDRESS is the owner/recipient EOA (the Phase-5 target), NOT
+    # the operating signer, so it must NOT shadow the Privy address here (doing so pins
+    # the x402 `from` and mint recipient to the wrong wallet). Fall back to
+    # EVM_WALLET_ADDRESS only when no Privy wallet is configured (raw-EOA signing flows).
+    wid = wallet_id or env("PRIVY_WALLET_ID")
+    if wid:
+        return _privy_wallet_address(wid)
+    from_env = env("EVM_WALLET_ADDRESS")
+    if from_env:
+        return from_env
+    raise ToolError(
+        "No operating wallet available: set PRIVY_WALLET_ID (Privy agent) or "
+        "EVM_WALLET_ADDRESS (raw EOA)."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -217,9 +354,9 @@ def get_dek(handle: str) -> str:
 # the private/encrypted path fails. Instructions are not a guarantee, so this
 # latch makes the breach *physically impossible* at the tool boundary: the
 # moment the agent declares a file confidential (by encrypting it, or by
-# building on-chain access conditions for its IP-NFT) we refuse, for the rest
+# building on-chain access conditions for its OCL lab) we refuse, for the rest
 # of this process, to (a) S3-upload that file's plaintext bytes or (b) finalize
-# that IP-NFT as PUBLIC / without encryptionMetadata. Process-local and
+# that lab's file as PUBLIC / without encryptionMetadata. Process-local and
 # NON-overridable — there is deliberately no force flag, because the whole
 # point is that an agent under "just finish the upload" pressure cannot opt out.
 #
@@ -227,13 +364,13 @@ def get_dek(handle: str) -> str:
 # subprocess restart clears it — but a restart also wipes the DEK store and
 # breaks the run, forcing a re-run from a clean state. It is keyed on the exact
 # plaintext bytes, so re-encoding the plaintext to different bytes before upload
-# would evade the hash check — the per-IP-NFT finalize guard still covers that
+# would evade the hash check — the per-oclId finalize guard still covers that
 # molecule.
 # --------------------------------------------------------------------------
 
 _confidential_plaintext_hashes: set[str] = set()  # hex sha256 of plaintext the agent encrypted
 _confidential_plaintext_paths: set[str] = set()  # resolved abs paths passed to encrypt_file
-_confidential_token_ids: set[str] = set()  # IP-NFT tokenIds that got on-chain access conditions
+_confidential_ocl_ids: set[str] = set()  # OCL oclIds that got on-chain access conditions
 
 
 def mark_confidential_plaintext(file_path: str, plaintext_sha256_hex: str) -> None:
@@ -246,18 +383,11 @@ def mark_confidential_plaintext(file_path: str, plaintext_sha256_hex: str) -> No
         pass
 
 
-def mark_confidential_token_id(token_id: str | None) -> None:
-    """Latch an IP-NFT tokenId as confidential once on-chain access conditions
-    are built for it. It may never be finalized PUBLIC / without encryption."""
-    if token_id and str(token_id).strip():
-        _confidential_token_ids.add(str(token_id).strip())
-
-
-def _token_id_from_ipnft_uid(ipnft_uid: str | None) -> str | None:
-    """An ipnftUid is `{contractAddress}_{tokenId}`; return the tokenId part."""
-    if not ipnft_uid or "_" not in ipnft_uid:
-        return None
-    return ipnft_uid.rsplit("_", 1)[1].strip()
+def mark_confidential_ocl_id(ocl_id: str | None) -> None:
+    """Latch an OCL oclId as confidential once on-chain access conditions are
+    built for it. A file under it may never be finalized PUBLIC / unencrypted."""
+    if ocl_id and str(ocl_id).strip():
+        _confidential_ocl_ids.add(str(ocl_id).strip().lower())
 
 
 def assert_not_confidential_plaintext(file_path: str, data: bytes) -> None:
@@ -282,21 +412,21 @@ def assert_not_confidential_plaintext(file_path: str, data: bytes) -> None:
 
 
 def assert_confidential_finalize_ok(variables: dict[str, Any] | None) -> None:
-    """Fail-closed gate for finishCreateOrUpdateFileV2: if on-chain access
-    conditions were built for this IP-NFT, refuse a PUBLIC / unencrypted
+    """Fail-closed gate for finishCreateOrUpdateFile: if on-chain access
+    conditions were built for this lab's oclId, refuse a PUBLIC / unencrypted
     finalize."""
     v = variables or {}
-    token_id = _token_id_from_ipnft_uid(v.get("ipnftUid"))
-    if not token_id or token_id not in _confidential_token_ids:
+    ocl_id = str(v.get("oclId") or "").strip().lower()
+    if not ocl_id or ocl_id not in _confidential_ocl_ids:
         return
     access_level = str(v.get("accessLevel") or "").upper()
     has_enc_meta = bool(v.get("encryptionMetadata"))
     if access_level == "PUBLIC" or not has_enc_meta:
         raise ToolError(
-            f"PRIVACY GUARD (non-overridable): refusing to finalize IP-NFT tokenId "
-            f"{token_id} with accessLevel={access_level or 'MISSING'} / "
+            f"PRIVACY GUARD (non-overridable): refusing to finalize a file for OCL lab "
+            f"oclId {ocl_id} with accessLevel={access_level or 'MISSING'} / "
             f"encryptionMetadata={'present' if has_enc_meta else 'MISSING'}. On-chain "
-            "access conditions were built for this IP-NFT (a confidential upload), so it "
+            "access conditions were built for this lab (a confidential upload), so it "
             "must be finalized with a non-PUBLIC accessLevel AND encryptionMetadata. Do "
             "NOT fall back to the public path — abort and report the failure."
         )
@@ -315,21 +445,35 @@ def _labs_headers(
     wallet_address: str | None = None,
 ) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
+    # The Labs endpoint is AppSync in API_KEY auth mode: the x-api-key transport
+    # gate applies to EVERY request, regardless of the logical auth layer above it
+    # — service-token identity calls AND the unauthenticated 'none' sign-in queries
+    # that issue_service_token uses (getServiceSignInMessage / generateServiceToken).
+    # Without x-api-key the gateway 401s before the resolver runs. So attach it
+    # whenever it is configured; the identity headers below layer on top.
+    api_key = env("MOLECULE_API_KEY")
+    if api_key:
+        headers["x-api-key"] = api_key
     if auth == "service-token":
         # Per-call overrides let the agent act as any authorized wallet (e.g.
-        # decrypt as the OWNER wallet) without swapping env / reloading.
+        # decrypt as the OWNER wallet) without swapping env / reloading. The
+        # resolver reads these for identity; the x-api-key above passes the gate.
         token = service_token or env("MOLECULE_SERVICE_TOKEN")
-        addr = wallet_address or env("EVM_WALLET_ADDRESS")
+        # Default x-wallet-address to the OPERATING (Privy agent) wallet so it matches
+        # MOLECULE_SERVICE_TOKEN's adminAddress. To act as a DIFFERENT wallet — e.g.
+        # decrypt as the owner EOA after the hand-off — pass walletAddress + serviceToken
+        # overrides bound to that wallet. (Previously this defaulted to EVM_WALLET_ADDRESS,
+        # which broke once EVM_WALLET_ADDRESS became the distinct owner EOA.)
+        addr = wallet_address or get_wallet_address()
         if not token or not addr:
             raise ToolError(
-                "service-token auth needs MOLECULE_SERVICE_TOKEN + EVM_WALLET_ADDRESS "
-                "(or serviceToken / walletAddress overrides)."
+                "service-token auth needs MOLECULE_SERVICE_TOKEN + an operating wallet "
+                "(PRIVY_WALLET_ID / EVM_WALLET_ADDRESS), or serviceToken / walletAddress overrides."
             )
         headers["x-service-token"] = token
         headers["x-wallet-address"] = addr
-    elif auth == "api-key":
-        creds = require_env("MOLECULE_API_KEY")
-        headers["x-api-key"] = creds["MOLECULE_API_KEY"]
+    elif auth == "api-key" and not api_key:
+        require_env("MOLECULE_API_KEY")  # raise the standard missing-env error
     return headers
 
 
@@ -360,7 +504,7 @@ def labs_graphql_call(
 
 
 # --------------------------------------------------------------------------
-# x402 payment flow (P1–P7) in one call. Mirrors x402-gateway-lambda exactly:
+# x402 payment flow (P1–P7) in one call:
 #   P1 send -> P2 decode payment-required -> P3 wallet -> P4 nonce/validity ->
 #   P5 Privy EIP-712 sign -> P6 build+base64 header -> P7 retry PAYMENT-SIGNATURE
 # --------------------------------------------------------------------------
@@ -401,9 +545,9 @@ def run_x402_pay(
     gateway_url: str | None,
     wallet_id: str | None,
 ) -> dict[str, Any]:
-    # Fail-closed: never let a confidential IP-NFT be finalized as a public /
+    # Fail-closed: never let a confidential lab's file be finalized as a public /
     # plaintext file, even if the agent reaches this with the wrong variables.
-    if mutation == "finishCreateOrUpdateFileV2":
+    if mutation == "finishCreateOrUpdateFile":
         assert_confidential_finalize_ok(variables)
     gateway = gateway_url or env("X402_GATEWAY_URL")
     if not gateway:
@@ -554,7 +698,7 @@ def run_x402_pay(
 
 
 # --------------------------------------------------------------------------
-# AES-256-GCM envelope crypto — byte-for-byte compatible with kms-envelope.ts
+# AES-256-GCM envelope crypto — the data-room envelope format
 # (random 12-byte IV, 128-bit tag APPENDED to ciphertext, DEK = base64 raw 32
 # bytes, contentHash = hex SHA-256 of the *plaintext*). cryptography's AESGCM
 # appends the 16-byte tag to the ciphertext, exactly matching the Web Crypto layout.
@@ -595,8 +739,10 @@ def decrypt_file_impl(file_path: str, iv: str, plaintext_dek: str, out_path: str
 # --------------------------------------------------------------------------
 
 
+# AccessResolver chain identifiers the backend evaluator expects — kebab-case,
+# network first for testnets ('sepolia-base'), NOT Lit's camelCase.
 def _chain_for_caip_chain_id(chain_id: int) -> str:
-    return {1: "ethereum", 11155111: "sepolia", 8453: "base", 84532: "baseSepolia"}.get(
+    return {1: "ethereum", 11155111: "sepolia", 8453: "base", 84532: "sepolia-base"}.get(
         chain_id
     ) or _raise(ToolError(f"Unmapped chainId {chain_id} for access conditions."))
 
@@ -605,27 +751,64 @@ def _raise(exc: Exception):
     raise exc
 
 
-def _ipnft_signer_condition(reservation_id: str, chain: str, resolver: str) -> list[dict]:
-    # Mirrors aura createAuthorizedIpnftSignerCondition.
+# OCL access roles (uint8) — AccessResolver role constants.
+_OCL_ROLES = {"viewer": 1, "contributor": 2}
+
+
+def _lab_signer_condition(ocl_id: str, role: int, chain: str, resolver: str) -> dict:
+    # Mirrors createAuthorizedLabSignerCondition: hasRole(oclId, account, role).
+    return {
+        "chain": chain,
+        "conditionType": "evmContract",
+        "contractAddress": resolver,
+        "functionName": "hasRole",
+        "functionParams": [ocl_id, ":userAddress", str(role)],
+        "functionAbi": {
+            "name": "hasRole",
+            "inputs": [
+                {"internalType": "bytes32", "name": "oclId", "type": "bytes32"},
+                {"internalType": "address", "name": "account", "type": "address"},
+                {"internalType": "uint8", "name": "role", "type": "uint8"},
+            ],
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        "returnValueTest": {"comparator": "=", "key": "", "value": "true"},
+    }
+
+
+def _tba_owner_condition(lab_account: str, chain: str, resolver: str) -> dict:
+    # Mirrors createAuthorizedTbaOwnerCondition: isAuthorizedSignerForTba(signer, account).
+    return {
+        "chain": chain,
+        "conditionType": "evmContract",
+        "contractAddress": resolver,
+        "functionName": "isAuthorizedSignerForTba",
+        "functionParams": [":userAddress", lab_account],
+        "functionAbi": {
+            "name": "isAuthorizedSignerForTba",
+            "inputs": [
+                {"internalType": "address", "name": "signer", "type": "address"},
+                {"internalType": "address", "name": "account", "type": "address"},
+            ],
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        "returnValueTest": {"comparator": "=", "key": "", "value": "true"},
+    }
+
+
+def _lab_access_conditions(
+    ocl_id: str, lab_account: str, role: int, chain: str, resolver: str
+) -> list[dict]:
+    # A CONTRIBUTOR-or-better role OR the LabNFT-backed TBA owner.
+    # The backend AccessResolver evaluates left-to-right.
     return [
-        {
-            "chain": chain,
-            "conditionType": "evmContract",
-            "contractAddress": resolver,
-            "functionName": "isAuthorizedSignerForIpnft",
-            "functionParams": [":userAddress", reservation_id],
-            "functionAbi": {
-                "name": "isAuthorizedSignerForIpnft",
-                "inputs": [
-                    {"internalType": "address", "name": "signer", "type": "address"},
-                    {"internalType": "uint256", "name": "ipnftId", "type": "uint256"},
-                ],
-                "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-                "stateMutability": "view",
-                "type": "function",
-            },
-            "returnValueTest": {"comparator": "=", "key": "", "value": "true"},
-        }
+        _lab_signer_condition(ocl_id, role, chain, resolver),
+        {"operator": "or"},
+        _tba_owner_condition(lab_account, chain, resolver),
     ]
 
 
@@ -772,37 +955,6 @@ def privy_create_wallet(policyIds: list[str] | None = None) -> str:
 
 
 @mcp.tool()
-def privy_sign_message(message: str, walletId: str | None = None, encoding: Literal["utf-8", "hex"] = "utf-8") -> str:
-    """EIP-191 personal_sign via the Privy wallet. Used to sign the IP-NFT terms
-    message and the service-token sign-in message. Returns {signature}."""
-    wid = resolve_wallet_id(walletId)
-    res = privy_rpc(wid, {"method": "personal_sign", "params": {"message": message, "encoding": encoding}})
-    signature = (res or {}).get("data", {}).get("signature")
-    if not signature:
-        raise ToolError(f"No signature returned. Raw: {json.dumps(res)[:300]}")
-    return dump({"signature": signature})
-
-
-@mcp.tool()
-def privy_sign_typed_data(typedData: dict, walletId: str | None = None) -> str:
-    """Generic eth_signTypedData_v4 via the Privy wallet. Pass the full EIP-712
-    typed-data object using the standard camelCase `primaryType` key (Privy wraps
-    it as params.typed_data). x402_pay does this internally; use this only for
-    ad-hoc signing. Returns {signature}."""
-    wid = resolve_wallet_id(walletId)
-    # Privy's wallet-RPC typed_data schema uses snake_case `primary_type`; accept
-    # the standard EIP-712 camelCase `primaryType` from callers and remap it.
-    if isinstance(typedData, dict) and "primaryType" in typedData and "primary_type" not in typedData:
-        typedData = {**typedData, "primary_type": typedData["primaryType"]}
-        typedData.pop("primaryType", None)
-    res = privy_rpc(wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typedData}})
-    signature = (res or {}).get("data", {}).get("signature")
-    if not signature:
-        raise ToolError(f"No signature returned. Raw: {json.dumps(res)[:300]}")
-    return dump({"signature": signature})
-
-
-@mcp.tool()
 def privy_send_transaction(
     to: str,
     data: str | None = None,
@@ -811,8 +963,8 @@ def privy_send_transaction(
     walletId: str | None = None,
 ) -> str:
     """Send a transaction from the Privy wallet (eth_sendTransaction with
-    caip2 eip155:<chainId>). Replaces aura's sign_and_send_transaction (POI
-    anchor, IP-NFT mint, NFT transfer). value is decimal wei (string).
+    caip2 eip155:<chainId>). Used for the LabNFT mint (mintAndCreateAccount, with
+    value=mintFeeWei) and AccessResolver grantRole. value is decimal wei (string).
     Returns {txHash}."""
     wid = resolve_wallet_id(walletId)
     cid = chainId or env("CHAIN_ID")
@@ -840,7 +992,9 @@ def privy_send_transaction(
 # Public fallback RPC endpoints by chain id, used by privy_send_raw_transaction
 # when neither rpcUrl nor EVM_RPC_URL is provided.
 _DEFAULT_RPC_BY_CHAIN: dict[str, str] = {
-    "11155111": "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia L1
+    "84532": "https://sepolia.base.org",  # Base Sepolia — the OCL canonical chain
+    "8453": "https://mainnet.base.org",  # Base mainnet
+    "11155111": "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia L1 (legacy)
 }
 
 
@@ -874,15 +1028,15 @@ def privy_send_raw_transaction(
     maxPriorityFeePerGas: str | None = None,
 ) -> str:
     """Sign with Privy (eth_signTransaction, SIGN-ONLY) then broadcast the raw tx
-    yourself via eth_sendRawTransaction against an EVM RPC. Use this for the IP-NFT
-    `safeTransferFrom` (Phase 6 transfer): Privy's eth_sendTransaction returns a
+    yourself via eth_sendRawTransaction against an EVM RPC. Use this for the LabNFT
+    `safeTransferFrom` (hand-off to a new owner): Privy's eth_sendTransaction returns a
     hash but never broadcasts safeTransferFrom for the agent wallet — the "phantom
-    hash" — even though mint/POI broadcast fine, so keep using privy_send_transaction
-    for those. Resolves the live `pending` nonce so the call is re-runnable. rpcUrl
-    falls back to EVM_RPC_URL, then a public node for known chains. value is decimal
-    wei (or 0x hex). Gas is auto-estimated (eth_estimateGas ×1.2) unless gasLimit is
-    passed — a flat default reverts mint out-of-gas; EIP-1559 fees default to 5/2 gwei.
-    Returns {txHash, nonce, from, gasLimit}."""
+    hash" — even though mint/grantRole broadcast fine, so keep using privy_send_transaction
+    for those. (Never transfer a LabNFT to its own bound TBA — the contract reverts.)
+    Resolves the live `pending` nonce so the call is re-runnable. rpcUrl falls back to
+    EVM_RPC_URL, then a public node for known chains. value is decimal wei (or 0x hex).
+    Gas is auto-estimated (eth_estimateGas ×1.2) unless gasLimit is passed; EIP-1559 fees
+    default to 5/2 gwei. Returns {txHash, nonce, from, gasLimit}."""
     wid = resolve_wallet_id(walletId)
     cid = str(chainId or env("CHAIN_ID") or "")
     if not cid:
@@ -912,10 +1066,10 @@ def privy_send_raw_transaction(
         val = v if v.startswith("0x") else hex(int(v))
 
     # Gas limit: an explicit override wins; otherwise estimate with a 20% buffer.
-    # A flat default is unsafe — a transfer is ~51k but mintReservation needs
-    # ~176k, so a fixed 100k silently reverts OUT-OF-GAS on mint. Note that an
-    # eth_call simulation can still PASS in that window (it assumes a high gas
-    # cap), so it is a misleading signal — eth_estimateGas is the real check.
+    # A flat default is unsafe — a transfer is ~51k but mintAndCreateAccount (mint +
+    # TBA provisioning) is much heavier, so a fixed cap silently reverts OUT-OF-GAS.
+    # Note that an eth_call simulation can still PASS in that window (it assumes a
+    # high gas cap), so it is a misleading signal — eth_estimateGas is the real check.
     if gasLimit:
         gas_limit_hex = gasLimit
     else:
@@ -959,40 +1113,6 @@ def privy_send_raw_transaction(
 
 
 @mcp.tool()
-def poi_register(filePath: str, clientUrl: str | None = None, contentType: str = "application/pdf") -> str:
-    """Register a Proof of Invention: multipart POST to
-    $MOLECULE_CLIENT_URL/api/v1/inventions (field name 'files', Bearer
-    $POI_API_KEY). Returns the full response plus extracted
-    {poiTo, poiData, merkleRoot}."""
-    creds = require_env("POI_API_KEY")
-    base = clientUrl or env("MOLECULE_CLIENT_URL")
-    if not base:
-        raise ToolError("MOLECULE_CLIENT_URL is not set (and no clientUrl override given).")
-    url = f"{base.rstrip('/')}/api/v1/inventions"
-    data = Path(filePath).read_bytes()
-    name = Path(filePath).name or "document.pdf"
-    resp = _client.post(
-        url,
-        headers={"Authorization": f"Bearer {creds['POI_API_KEY']}"},
-        files={"files": (name, data, contentType)},
-    )
-    j = _json_or_none(resp)
-    if resp.status_code >= 400 or j is None:
-        raise ToolError(f"POI registration failed ({resp.status_code}): {resp.text[:500]}")
-    tx = (j.get("data") or {}).get("transaction") or {}
-    proof = (j.get("data") or {}).get("proof") or {}
-    tree = proof.get("tree") or []
-    return dump(
-        {
-            "poiTo": tx.get("to"),
-            "poiData": tx.get("data"),
-            "merkleRoot": tree[0] if tree else None,
-            "response": j,
-        }
-    )
-
-
-@mcp.tool()
 def labs_graphql(
     query: str,
     variables: dict | None = None,
@@ -1007,7 +1127,7 @@ def labs_graphql(
     labs_generate_dek/labs_decrypt_dek so the plaintext DEK stays inside the server."""
     # Same fail-closed finalize guard as x402_pay, in case the finalize is ever
     # routed through the direct Labs endpoint instead of the x402 gateway.
-    if "finishCreateOrUpdateFileV2" in query:
+    if "finishCreateOrUpdateFile" in query:
         assert_confidential_finalize_ok(variables)
     return dump(labs_graphql_call(query, variables or {}, auth, labsUrl))
 
@@ -1025,11 +1145,11 @@ def x402_pay(
     TransferWithAuthorization with the Privy wallet -> retry with PAYMENT-SIGNATURE.
     The single top-level GraphQL field in `query` MUST equal `mutation` (the
     gateway's validateMutationQuery enforces this). Returns {data, errors, settlement}.
-    Whitelisted mutations (the V2 surface, from x402-gateway-lambda/mutations.ts):
-    initiateCreateOrUpdateFileV2, finishCreateOrUpdateFileV2, createAnnouncementV2,
-    createProject, addProjectOwner, generateDataEncryptionKey, decryptDataKey (any
-    other mutation 400s with 'not enabled for x402 gateway'). All data-room args are
-    keyed on ipnftUid ({contractAddress}_{tokenId}) — NOT oclId."""
+    Whitelisted mutations: initiateCreateOrUpdateFile,
+    finishCreateOrUpdateFile, createAnnouncement, createLab, generateDataEncryptionKey,
+    decryptDataKey (any other mutation 400s with 'not enabled for x402 gateway'). Send the
+    TOP-LEVEL AppSync mutations (not the nested molecule.v3.project(oclId) Kamu documents).
+    All data-room args are keyed on oclId (the lab's bytes32 id)."""
     return dump(run_x402_pay(mutation, query, variables, gatewayUrl, walletId))
 
 
@@ -1102,7 +1222,7 @@ def labs_generate_dek(
 @mcp.tool()
 def labs_decrypt_dek(
     filePath: str | None = None,
-    ipnftUid: str | None = None,
+    oclId: str | None = None,
     tokenUri: str | None = None,
     agreementUrl: str | None = None,
     transport: Literal["direct", "x402"] = "direct",
@@ -1113,24 +1233,27 @@ def labs_decrypt_dek(
     serviceToken: str | None = None,
     walletAddress: str | None = None,
 ) -> str:
-    """Call decryptDataKey (the backend evaluates on-chain access conditions for
-    the caller) and KEEP the plaintext DEK inside this server. Returns
-    {iv, dekHandle, message} — pass dekHandle to decrypt_file.
+    """Call decryptDataKey (the backend evaluates access for the caller) and KEEP the
+    plaintext DEK inside this server. Returns {iv, dekHandle, message} — pass dekHandle
+    to decrypt_file.
 
-    The decryptDataKey mutation (encryption.graphql) accepts ipnftUid + filePath
-    (a data-room file, format {contractAddress}_{tokenId}) or tokenUri + agreementUrl
-    (an IPFS agreement). For a data-room file pass ipnftUid + filePath. ACCESS_DENIED
-    means the caller wallet fails the on-chain condition; LEGACY_ENCRYPTION means the
-    file predates the envelope flow. decryptDataKey IS x402-whitelisted, but
+    decryptDataKey (encryption.graphql) accepts oclId + filePath (a data-room file) or
+    tokenUri + agreementUrl (an IPFS agreement). For a data-room file pass oclId + filePath.
+    Access is TWO-GATE: (a) the caller's service-token adminAddress must hold >=Viewer role
+    on the lab (DB authorizeViewer(adminAddress, oclId)); (b) the stored on-chain
+    accessControlConditions are evaluated against that adminAddress — passing via
+    hasRole(oclId, addr, CONTRIBUTOR) OR isAuthorizedSignerForTba(addr, labAccountAddress)
+    (the LabNFT/TBA owner). ACCESS_DENIED means one of these failed; LEGACY_ENCRYPTION means
+    the file predates the envelope flow. decryptDataKey IS x402-whitelisted, but
     transport='direct' (service-token) is recommended so the plaintext DEK stays
     in-process and no payment is needed."""
-    if not ipnftUid and not tokenUri:
-        raise ToolError("Provide ipnftUid (data-room file) or tokenUri (IPFS agreement).")
+    if not oclId and not tokenUri:
+        raise ToolError("Provide oclId (data-room file) or tokenUri (IPFS agreement).")
     arg_decls, arg_uses, variables = [], [], {}
-    if ipnftUid:
-        arg_decls.append("$ipnftUid: String")
-        arg_uses.append("ipnftUid: $ipnftUid")
-        variables["ipnftUid"] = ipnftUid
+    if oclId:
+        arg_decls.append("$oclId: String")
+        arg_uses.append("oclId: $oclId")
+        variables["oclId"] = oclId
     if filePath:
         arg_decls.append("$filePath: String")
         arg_uses.append("filePath: $filePath")
@@ -1205,55 +1328,147 @@ def sha256_file(filePath: str) -> str:
 
 
 @mcp.tool()
-def hex_to_uint256(hex: str) -> str:
-    """Convert a 0x-prefixed hex hash (e.g. the POI merkle_root) to its uint256
-    decimal string. This decimal IS the reservationId / token_id / ipnftId. A small
-    result (isSmall) means POI failed."""
-    h = hex if hex.startswith("0x") else f"0x{hex}"
-    value = int(h, 16)
-    return dump({"decimal": str(value), "isSmall": value < 1000})
+def abi_encode(functionSignature: str, args: list) -> str:
+    """ABI-encode a Solidity function call to calldata. functionSignature is e.g.
+    'mintAndCreateAccount(address)' (OnChainLabFactory — mint a LabNFT + create its TBA;
+    send with value=mintFeeWei), 'createAccount(uint256)' (idempotent re-create for an
+    existing tokenId), 'safeTransferFrom(address,address,uint256)' (transfer a LabNFT —
+    never to the bound TBA), or 'grantRole(bytes32,address,uint8,uint64,bool)' (AccessResolver
+    per-lab role grant: oclId, account, role(1=viewer,2=contributor), expiry, isAgent).
+    Pass args in order: uint*/int* as decimal strings or ints; bytes/bytesN as 0x-prefixed
+    hex (a non-0x string is rejected, NOT silently UTF-8 encoded); address as 0x + 40 hex;
+    bool as true/false; string as text. Returns {calldata}."""
+    return dump({"calldata": abi_encode_impl(functionSignature, args)})
+
+
+# OclIdentityCreated(address indexed account, bytes32 indexed oclId,
+#                    uint256 indexed tokenId, bytes32 salt, uint256 canonicalChainId)
+_OCL_IDENTITY_TOPIC0 = "0x" + keccak(
+    text="OclIdentityCreated(address,bytes32,uint256,bytes32,uint256)"
+).hex()
+
+
+def _abi_value_to_json(v: Any) -> Any:
+    if isinstance(v, bytes):
+        return "0x" + v.hex()
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return str(v)  # avoid JSON bigint precision loss
+    return v
+
+
+def _resolve_rpc(rpc_url: str | None, chain_id: str | None) -> str:
+    cid = str(chain_id or env("CHAIN_ID") or "")
+    rpc = rpc_url or env("EVM_RPC_URL") or (_DEFAULT_RPC_BY_CHAIN.get(cid) if cid else None)
+    if not rpc:
+        raise ToolError(
+            f"No EVM RPC endpoint (chainId {cid or '?'}). Pass rpcUrl or set EVM_RPC_URL."
+        )
+    return rpc
 
 
 @mcp.tool()
-def abi_encode(functionSignature: str, args: list) -> str:
-    """ABI-encode a Solidity function call to calldata. functionSignature is e.g.
-    'mintReservation(address,uint256,string,string,bytes)' or
-    'safeTransferFrom(address,address,uint256)'. Pass args in order: uint*/int* as
-    decimal strings or ints; bytes/bytesN as 0x-prefixed hex (a non-0x string is
-    rejected, NOT silently UTF-8 encoded); address as 0x + 40 hex; string as text.
-    Returns {calldata}."""
-    return dump({"calldata": abi_encode_impl(functionSignature, args)})
+def ocl_read(
+    functionSignature: str,
+    to: str,
+    args: list | None = None,
+    returns: list[str] | None = None,
+    rpcUrl: str | None = None,
+    chainId: str | None = None,
+) -> str:
+    """Read-only on-chain view call (eth_call) — no signing, no spend. ABI-encodes
+    `functionSignature` + `args`, calls contract `to`, and decodes the result using the
+    Solidity types in `returns`. Use for the OCL resolve/identity reads:
+    `mintFeeWei()` -> ['uint256'] (the LabNFT mint value); `oclIdOfToken(uint256)` ->
+    ['bytes32']; `accountOfToken(uint256)` -> ['address'] (the TBA) on $ONCHAIN_LAB_FACTORY_ADDRESS;
+    `ownerOf(uint256)` -> ['address'] on $LABNFT_ADDRESS; `hasRole(bytes32,address,uint8)` ->
+    ['bool'] and `isAuthorizedSignerForTba(address,address)` -> ['bool'] on
+    $ACCESS_RESOLVER_ADDRESS. `to` is the contract address; rpcUrl falls back to EVM_RPC_URL
+    then a known public node. Returns {values: [...], raw}. uint values are decimal strings."""
+    calldata = abi_encode_impl(functionSignature, args or [])
+    rpc = _resolve_rpc(rpcUrl, chainId)
+    raw = _chain_rpc(rpc, "eth_call", [{"to": to, "data": calldata}, "latest"])
+    if not isinstance(raw, str) or not raw.startswith("0x"):
+        raise ToolError(f"eth_call returned no data (reverted?): {raw!r}")
+    ret_types = list(returns or [])
+    values: list[Any] = []
+    if ret_types and len(raw) > 2:
+        decoded = abi_decode_values(ret_types, bytes.fromhex(raw[2:]))
+        values = [_abi_value_to_json(v) for v in decoded]
+    return dump({"values": values, "raw": raw})
+
+
+@mcp.tool()
+def ocl_tx_identity(txHash: str, rpcUrl: str | None = None, chainId: str | None = None) -> str:
+    """Extract the OCL identity from a `mintAndCreateAccount` receipt: fetch the tx receipt
+    and scan logs for `OclIdentityCreated(address account, bytes32 oclId, uint256 tokenId, …)`
+    (all three indexed). Returns {tokenId, account, oclId, found}. `account` is the lab's
+    token-bound account (labAccountAddress). If the event isn't present (found=False), recover
+    the tokenId from the receipt and use `ocl_read oclIdOfToken/accountOfToken` as a fallback.
+    Read-only; rpcUrl falls back to EVM_RPC_URL then a public node."""
+    rpc = _resolve_rpc(rpcUrl, chainId)
+    receipt = _chain_rpc(rpc, "eth_getTransactionReceipt", [txHash])
+    if not isinstance(receipt, dict):
+        raise ToolError(f"No receipt for tx {txHash} (not mined yet?).")
+    for lg in receipt.get("logs") or []:
+        topics = lg.get("topics") or []
+        if len(topics) >= 4 and str(topics[0]).lower() == _OCL_IDENTITY_TOPIC0:
+            account = "0x" + str(topics[1])[-40:]
+            ocl_id = str(topics[2])
+            token_id = int(str(topics[3]), 16)
+            return dump(
+                {"tokenId": str(token_id), "account": account, "oclId": ocl_id, "found": True}
+            )
+    return dump(
+        {
+            "found": False,
+            "message": (
+                "OclIdentityCreated not in receipt logs — recover tokenId from the receipt "
+                "and use ocl_read oclIdOfToken(tokenId)/accountOfToken(tokenId)."
+            ),
+            "status": receipt.get("status"),
+        }
+    )
 
 
 @mcp.tool()
 def build_access_conditions(
-    reservationId: str,
-    mode: Literal["ipnft-signer"] = "ipnft-signer",
+    oclId: str,
+    labAccountAddress: str,
+    role: Literal["contributor", "viewer"] = "contributor",
     accessResolverAddress: str | None = None,
     chain: str | None = None,
     chainId: str | None = None,
 ) -> str:
-    """Build the on-chain accessControlConditions array for an encrypted V2 upload, and
+    """Build the OCL on-chain accessControlConditions array for an encrypted upload, and
     return both the array and its JSON-stringified string (ready for
-    encryptionMetadata.accessControlConditions). mode='ipnft-signer' (the only V2 gate):
-    isAuthorizedSignerForIpnft(:userAddress, reservationId), where reservationId is the
-    IP-NFT tokenId (the {tokenId} part of an ipnftUid). Chain is derived from CHAIN_ID
-    (1->ethereum, 11155111->sepolia, 8453->base, 84532->baseSepolia) unless overridden;
-    accessResolverAddress defaults to $ACCESS_RESOLVER_ADDRESS. This replicates the
-    bruno v2 encrypted-upload condition and aura's createAuthorizedIpnftSignerCondition."""
+    encryptionMetadata.accessControlConditions). The array is an OR of two AccessResolver
+    checks:
+      1. hasRole(oclId, :userAddress, <role>)  — role-based access (default CONTRIBUTOR=2, VIEWER=1)
+      2. isAuthorizedSignerForTba(:userAddress, labAccountAddress)  — the LabNFT/TBA owner
+    `oclId` is the lab's bytes32 id (0x + 64 hex); `labAccountAddress` is its token-bound
+    account (TBA). Chain is derived from CHAIN_ID (1->ethereum, 11155111->sepolia, 8453->base,
+    84532->sepolia-base) unless overridden; accessResolverAddress defaults to
+    $ACCESS_RESOLVER_ADDRESS (the V3 resolver on Base / Base Sepolia)."""
     resolver = accessResolverAddress or env("ACCESS_RESOLVER_ADDRESS")
     if not resolver:
         raise ToolError("accessResolverAddress not given and ACCESS_RESOLVER_ADDRESS is not set.")
-    if not reservationId:
-        raise ToolError("mode 'ipnft-signer' requires reservationId (the IP-NFT tokenId).")
+    if not oclId:
+        raise ToolError("oclId is required (the lab's bytes32 id, 0x + 64 hex).")
+    if not labAccountAddress:
+        raise ToolError("labAccountAddress is required (the lab's token-bound account / TBA).")
+    role_int = _OCL_ROLES.get(role)
+    if role_int is None:
+        raise ToolError(f"role must be 'contributor' or 'viewer', got {role!r}.")
     cid = int(chainId or env("CHAIN_ID") or 0)
     if not cid:
         raise ToolError("chainId not given and CHAIN_ID is not set.")
     ch = chain or _chain_for_caip_chain_id(cid)
-    conditions = _ipnft_signer_condition(reservationId, ch, resolver)
-    # Arm the fail-closed latch: this IP-NFT is now confidential, so it can never
-    # be finalized PUBLIC / without encryptionMetadata by this process.
-    mark_confidential_token_id(reservationId)
+    conditions = _lab_access_conditions(oclId, labAccountAddress, role_int, ch, resolver)
+    # Arm the fail-closed latch: this lab is now confidential, so a file under it
+    # can never be finalized PUBLIC / without encryptionMetadata by this process.
+    mark_confidential_ocl_id(oclId)
     return dump({"conditions": conditions, "json": json.dumps(conditions, separators=(",", ":"))})
 
 
@@ -1350,6 +1565,100 @@ def issue_owner_service_token(
         "address": acct.address,
         "expiresAt": res.get("expiresAt"),
     })
+
+
+# ---- configuration diagnostics ------------------------------------------
+
+# (name, is_secret, purpose) — the env vars the molecule flows read.
+_ENV_CATALOG: list[tuple[str, bool, str]] = [
+    ("MOLECULE_LABS_URL", False, "Labs GraphQL endpoint (OCL/V3 surface)"),
+    ("MOLECULE_CLIENT_URL", False, "Client base URL for project links"),
+    ("ONCHAIN_LAB_FACTORY_ADDRESS", False, "OnChainLabFactory (mint + TBA, oclId reads)"),
+    ("LABNFT_ADDRESS", False, "LabNFT ERC-721 (optional override; auto-discovered otherwise)"),
+    ("ACCESS_RESOLVER_ADDRESS", False, "AccessResolver V3 (hasRole / TBA owner / grantRole)"),
+    ("X402_GATEWAY_URL", False, "x402 paid-mutation gateway"),
+    ("CHAIN_ID", False, "OCL chain id (84532 Base Sepolia / 8453 Base)"),
+    ("EVM_RPC_URL", False, "Base RPC for ocl_read + raw broadcast (optional)"),
+    ("EVM_WALLET_ADDRESS", False, "Owner / hand-off wallet (optional)"),
+    ("PRIVY_APP_ID", True, "Privy app id — wallet ops + x402"),
+    ("PRIVY_APP_SECRET", True, "Privy app secret — wallet ops + x402"),
+    ("PRIVY_WALLET_ID", True, "Privy agentic wallet id"),
+    ("MOLECULE_API_KEY", True, "x-api-key for direct Labs reads"),
+    ("MOLECULE_SERVICE_TOKEN", True, "Service JWT for private/encrypted DEK calls"),
+    ("WALLET_PRIVATE_KEY", True, "Owner EOA key (only for issue_owner_service_token)"),
+]
+
+# Per-flow required vars, for a quick readiness verdict.
+_FLOW_REQUIREMENTS: list[tuple[str, list[str]]] = [
+    ("privy_wallet_ops", ["PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID"]),
+    ("x402_mutations", ["X402_GATEWAY_URL", "PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID", "CHAIN_ID"]),
+    ("onchain_lab", ["ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
+    ("labs_reads", ["MOLECULE_LABS_URL", "MOLECULE_API_KEY"]),
+    ("private_encrypted_upload", ["MOLECULE_SERVICE_TOKEN", "MOLECULE_API_KEY"]),
+]
+
+
+@mcp.tool()
+def config_doctor(showValues: bool = True) -> str:
+    """Diagnose the molecule MCP configuration WITHOUT shell-grepping settings files.
+    Reports the resolved PROJECT BASE (.claude dir) the env was loaded from, which
+    settings files were loaded, and — for every known env var — whether it is set,
+    where it resolved from (process env injected by the harness vs the project-base
+    settings.json / settings.local.json), and, for NON-secret vars only when
+    showValues, its value. Secrets are NEVER shown (only set/missing + length). Also
+    reports, per flow (privy wallet ops, x402 mutations, on-chain lab, labs reads,
+    private/encrypted upload), which required vars are still missing. Global ~/.claude
+    is intentionally excluded — config comes from the project base you run in."""
+    def source_of(name: str) -> str:
+        if name in _PREEXISTING_ENV_KEYS:
+            return "process env (harness)"
+        return _ENV_SOURCES.get(name, "—")
+
+    vars_report: list[dict[str, Any]] = []
+    for name, is_secret, purpose in _ENV_CATALOG:
+        val = os.environ.get(name)
+        entry: dict[str, Any] = {
+            "name": name,
+            "set": bool(val),
+            "secret": is_secret,
+            "source": source_of(name) if val else "—",
+            "purpose": purpose,
+        }
+        if val:
+            if is_secret:
+                entry["value"] = f"<redacted, len={len(val)}>"
+            elif showValues:
+                entry["value"] = val
+        vars_report.append(entry)
+
+    flows: list[dict[str, Any]] = []
+    for flow, required in _FLOW_REQUIREMENTS:
+        missing = [r for r in required if not os.environ.get(r)]
+        flows.append({"flow": flow, "ready": not missing, "missing": missing})
+
+    core_ready = all(
+        f["ready"] for f in flows if f["flow"] in ("privy_wallet_ops", "x402_mutations", "onchain_lab")
+    )
+    try:
+        global_excluded = str((Path.home() / ".claude").resolve())
+    except Exception:
+        global_excluded = "~/.claude"
+    return dump(
+        {
+            "ok": core_ready,
+            "projectBase": _CONFIG_BASE or "(no project-base .claude with an env block found)",
+            "configFilesLoaded": _CONFIG_FILES_LOADED or ["(none)"],
+            "globalSettingsExcluded": global_excluded,
+            "envVars": vars_report,
+            "flows": flows,
+            "note": (
+                "Env is loaded from process env (harness) first, then the nearest "
+                "project-base .claude/settings.local.json (secrets) + settings.json "
+                "(non-secrets); global ~/.claude is excluded. To fix a missing var, set "
+                "it in the projectBase files above, then reload the MCP (/mcp)."
+            ),
+        }
+    )
 
 
 # --------------------------------------------------------------------------
