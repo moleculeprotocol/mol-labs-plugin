@@ -298,25 +298,161 @@ def _privy_wallet_address(wallet_id: str) -> str:
     return j["address"]
 
 
-def get_wallet_address(wallet_id: str | None = None) -> str:
-    # Operating identity = the Privy wallet that actually SIGNS (mint, x402, uploads,
-    # the agent's service-token calls). Resolve its REAL on-chain address first, so the
-    # agent can differ from the owner/recipient EOA (EVM_WALLET_ADDRESS) — required for a
-    # genuine hand-off where the LabNFT is transferred to a distinct EOA that then
-    # decrypts. EVM_WALLET_ADDRESS is the owner/recipient EOA (the Phase-5 target), NOT
-    # the operating signer, so it must NOT shadow the Privy address here (doing so pins
-    # the x402 `from` and mint recipient to the wrong wallet). Fall back to
-    # EVM_WALLET_ADDRESS only when no Privy wallet is configured (raw-EOA signing flows).
-    wid = wallet_id or env("PRIVY_WALLET_ID")
-    if wid:
-        return _privy_wallet_address(wid)
+# --------------------------------------------------------------------------
+# Wallet backend selection — Privy agentic wallet OR raw EOA, the user's choice.
+#
+# There are two SIGNING backends, each with its OWN optional env set; nothing is
+# required until the user picks one (or configures exactly one and lets it be
+# auto-selected). The two are NOT interchangeable through a single key:
+#   * "privy" — a Privy *agentic* wallet. Privy NEVER exposes its private key, so it
+#     signs server-side via the Privy API. Needs PRIVY_APP_ID + PRIVY_APP_SECRET +
+#     PRIVY_WALLET_ID.
+#   * "eoa"   — a raw EOA. Signs LOCALLY in this process with eth-account. Needs
+#     WALLET_PRIVATE_KEY (the address is derived from it; EVM_WALLET_ADDRESS is used
+#     only for watch-only reads when no key is present).
+# The user is always in control: set WALLET_BACKEND=privy|eoa (or pass a per-call
+# `backend`) to choose explicitly. If exactly one backend is configured it is
+# auto-selected; if BOTH are configured the choice is required — we refuse to guess
+# which wallet spends.
+# --------------------------------------------------------------------------
+
+WalletBackend = Literal["privy", "eoa"]
+
+
+def _privy_creds_present() -> bool:
+    return bool(env("PRIVY_APP_ID") and env("PRIVY_APP_SECRET"))
+
+
+def _privy_wallet_present() -> bool:
+    return bool(_privy_creds_present() and env("PRIVY_WALLET_ID"))
+
+
+def _eoa_key_present() -> bool:
+    return bool(env("WALLET_PRIVATE_KEY"))
+
+
+def available_backends() -> list[str]:
+    """Backends whose required env is fully present (a signer is actually usable)."""
+    out: list[str] = []
+    if _privy_wallet_present():
+        out.append("privy")
+    if _eoa_key_present():
+        out.append("eoa")
+    return out
+
+
+def resolve_backend(explicit: str | None = None) -> str:
+    """Resolve the active signing backend. Precedence: explicit arg > $WALLET_BACKEND >
+    auto-select the single configured backend. Raises a clear, actionable error when
+    nothing is configured, when both are configured but no choice was made, or when an
+    explicit choice lacks its env."""
+    choice = (explicit or env("WALLET_BACKEND") or "").strip().lower()
+    if choice:
+        if choice not in ("privy", "eoa"):
+            raise ToolError(f"backend / WALLET_BACKEND must be 'privy' or 'eoa', got {choice!r}.")
+        if choice == "privy" and not _privy_wallet_present():
+            raise ToolError(
+                "backend 'privy' selected but PRIVY_APP_ID / PRIVY_APP_SECRET / PRIVY_WALLET_ID "
+                "are not all set. Configure the Privy agentic wallet, or pick backend 'eoa'."
+            )
+        if choice == "eoa" and not _eoa_key_present():
+            raise ToolError(
+                "backend 'eoa' selected but WALLET_PRIVATE_KEY is not set. Provide the raw EOA "
+                "private key, or pick backend 'privy'."
+            )
+        return choice
+    avail = available_backends()
+    if len(avail) == 1:
+        return avail[0]
+    if not avail:
+        raise ToolError(
+            "No signing wallet configured (every wallet env var is optional until you choose). "
+            "Pick ONE: Privy agentic wallet → set PRIVY_APP_ID + PRIVY_APP_SECRET + PRIVY_WALLET_ID; "
+            "or raw EOA → set WALLET_PRIVATE_KEY. Optionally set WALLET_BACKEND=privy|eoa to be explicit."
+        )
+    raise ToolError(
+        "Both a Privy agentic wallet and a raw EOA are configured — which one should sign is "
+        "ambiguous. Choose explicitly: set WALLET_BACKEND=privy|eoa (or pass backend=...). "
+        "The user decides which wallet spends."
+    )
+
+
+# ---- raw-EOA local signing (eth-account; the key never leaves this process) ----
+
+
+def _eoa_account():
+    """The eth-account LocalAccount for WALLET_PRIVATE_KEY (the raw EOA signer)."""
+    try:
+        from eth_account import Account
+    except ImportError as e:  # pragma: no cover
+        raise ToolError(f"eth-account is required for EOA signing: {e}")
+    pk = env("WALLET_PRIVATE_KEY")
+    if not pk:
+        raise ToolError("EOA backend needs WALLET_PRIVATE_KEY (the raw EOA private key).")
+    return Account.from_key(pk)
+
+
+def _eoa_address() -> str:
+    return _eoa_account().address
+
+
+def _eoa_sign_typed(domain_data: dict, message_types: dict, message_data: dict) -> str:
+    """Sign an EIP-712 typed message locally with the EOA key (eth-account). Returns a
+    0x-prefixed signature — the EOA analogue of Privy's eth_signTypedData_v4."""
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+
+    acct = _eoa_account()
+    signable = encode_typed_data(domain_data, message_types, message_data)
+    sig = Account.sign_message(signable, acct.key).signature.hex()
+    return sig if sig.startswith("0x") else "0x" + sig
+
+
+def _eoa_sign_and_send(transaction: dict, rpc: str) -> str:
+    """Sign a transaction with the EOA key and broadcast it via eth_sendRawTransaction."""
+    from eth_account import Account
+
+    acct = _eoa_account()
+    signed = Account.sign_transaction(transaction, acct.key)
+    raw = getattr(signed, "raw_transaction", None)
+    if raw is None:  # older eth-account exposed rawTransaction
+        raw = getattr(signed, "rawTransaction")
+    raw_hex = raw.hex() if isinstance(raw, (bytes, bytearray)) else str(raw)
+    if not raw_hex.startswith("0x"):
+        raw_hex = "0x" + raw_hex
+    return _chain_rpc(rpc, "eth_sendRawTransaction", [raw_hex])
+
+
+def get_wallet_address(wallet_id: str | None = None, backend: str | None = None) -> str:
+    # Operating identity = the wallet that actually SIGNS (mint, x402, uploads, the
+    # agent's service-token calls). Resolve it per the SELECTED backend:
+    #   * privy → the Privy wallet's REAL on-chain address, so the agent can differ from
+    #     the owner/recipient EOA (EVM_WALLET_ADDRESS) — required for a genuine hand-off
+    #     where the LabNFT is transferred to a distinct EOA that then decrypts.
+    #   * eoa   → the address derived from WALLET_PRIVATE_KEY (guarantees signer == from),
+    #     falling back to EVM_WALLET_ADDRESS only when no key is present (watch-only reads).
+    # An explicit Privy walletId always resolves directly (legacy callers / overrides).
+    # Under the privy backend, EVM_WALLET_ADDRESS is the owner/recipient EOA (the Phase-5
+    # target), NOT the operating signer, so it must NOT shadow the Privy address (doing so
+    # would pin the x402 `from` and mint recipient to the wrong wallet).
+    if wallet_id:
+        return _privy_wallet_address(wallet_id)
+    if not available_backends():
+        # Nothing configured to sign with — a watch-only EVM_WALLET_ADDRESS still resolves
+        # an address for read flows. (If both backends were configured we instead fall
+        # through to resolve_backend so the ambiguity is surfaced, not silently papered over.)
+        from_env = env("EVM_WALLET_ADDRESS")
+        if from_env:
+            return from_env
+    b = resolve_backend(backend)
+    if b == "privy":
+        return _privy_wallet_address(env("PRIVY_WALLET_ID"))
+    if _eoa_key_present():
+        return _eoa_address()
     from_env = env("EVM_WALLET_ADDRESS")
     if from_env:
         return from_env
-    raise ToolError(
-        "No operating wallet available: set PRIVY_WALLET_ID (Privy agent) or "
-        "EVM_WALLET_ADDRESS (raw EOA)."
-    )
+    raise ToolError("EOA backend has no address: set WALLET_PRIVATE_KEY or EVM_WALLET_ADDRESS.")
 
 
 # --------------------------------------------------------------------------
@@ -544,6 +680,7 @@ def run_x402_pay(
     variables: dict[str, Any] | None,
     gateway_url: str | None,
     wallet_id: str | None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     # Fail-closed: never let a confidential lab's file be finalized as a public /
     # plaintext file, even if the agent reaches this with the wrong variables.
@@ -552,7 +689,10 @@ def run_x402_pay(
     gateway = gateway_url or env("X402_GATEWAY_URL")
     if not gateway:
         raise ToolError("X402_GATEWAY_URL is not set.")
-    wid = resolve_wallet_id(wallet_id)
+    # x402 is just EIP-712 TransferWithAuthorization signing — either backend can pay,
+    # the user chooses. Only the 'privy' backend resolves a wallet id (the EOA signs locally).
+    b = resolve_backend(backend)
+    wid = resolve_wallet_id(wallet_id) if b == "privy" else None
     endpoint = f"{gateway.rstrip('/')}/x402/labs/{mutation}"
     body_str = json.dumps({"query": query, "variables": variables or {}})
 
@@ -583,23 +723,29 @@ def run_x402_pay(
     if not amount or not asset or not pay_to:
         raise ToolError(f'x402 challenge for "{mutation}" is missing amount/asset/payTo.')
 
-    # P3 — wallet address. EIP-3009 requires the authorization `from` to be the
-    # address whose key signs. Privy always signs with the wallet's own key, so a
-    # stale EVM_WALLET_ADDRESS that differs from the Privy wallet produces a
-    # signature the facilitator recovers to a different signer and rejects with a
-    # generic "Payment verification failed". Catch that here with a clear message.
-    wallet_address = get_wallet_address(wid)
-    _auth, _phdr = _privy_auth()
-    _wj = _json_or_none(_client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=_auth, headers=_phdr))
-    signer_address = (_wj or {}).get("address")
-    if signer_address and wallet_address.lower() != signer_address.lower():
-        raise ToolError(
-            f"x402 payment would be rejected: the EIP-3009 `from` ({wallet_address}) "
-            f"does not match the Privy signing wallet {wid} ({signer_address}). The "
-            f"facilitator recovers the signer from the signature and fails verification "
-            f"when signer != from. Set EVM_WALLET_ADDRESS to {signer_address}, or point "
-            f"PRIVY_WALLET_ID at the {wallet_address} wallet."
+    # P3 — wallet address. EIP-3009 requires the authorization `from` to be the address
+    # whose key signs.
+    if b == "privy":
+        # Privy always signs with the wallet's own key, so a stale EVM_WALLET_ADDRESS that
+        # differs from the Privy wallet produces a signature the facilitator recovers to a
+        # different signer and rejects with a generic "Payment verification failed". Catch
+        # that here with a clear message.
+        wallet_address = get_wallet_address(wid)
+        _auth, _phdr = _privy_auth()
+        _wj = _json_or_none(
+            _client.get(f"{PRIVY_BASE_URL}/v1/wallets/{wid}", auth=_auth, headers=_phdr)
         )
+        signer_address = (_wj or {}).get("address")
+        if signer_address and wallet_address.lower() != signer_address.lower():
+            raise ToolError(
+                f"x402 payment would be rejected: the EIP-3009 `from` ({wallet_address}) "
+                f"does not match the Privy signing wallet {wid} ({signer_address}). The "
+                f"facilitator recovers the signer from the signature and fails verification "
+                f"when signer != from. Set EVM_WALLET_ADDRESS to {signer_address}, or point "
+                f"PRIVY_WALLET_ID at the {wallet_address} wallet."
+            )
+    else:  # eoa — the EOA key derives `from`, so signer == from by construction.
+        wallet_address = _eoa_address()
 
     # P4 — nonce, validAfter, validBefore.
     now = int(time.time())
@@ -608,51 +754,69 @@ def run_x402_pay(
     valid_before = str(now + max_timeout)
     chain_id = _chain_id_from_network(network)
 
-    # P5 — EIP-712 TransferWithAuthorization signed by the Privy wallet.
-    # NOTE: Privy's wallet-RPC typed_data schema is snake_case all the way down —
-    # the primary type field is `primary_type`, not the EIP-712 `primaryType`
-    # (see EthereumSignTypedDataRpcInput.Params.TypedData in @privy-io/node). The
-    # API rejects camelCase `primaryType` with a 400.
-    typed_data = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            "TransferWithAuthorization": [
-                {"name": "from", "type": "address"},
-                {"name": "to", "type": "address"},
-                {"name": "value", "type": "uint256"},
-                {"name": "validAfter", "type": "uint256"},
-                {"name": "validBefore", "type": "uint256"},
-                {"name": "nonce", "type": "bytes32"},
-            ],
-        },
-        "primary_type": "TransferWithAuthorization",
-        "domain": {
-            "name": extra.get("name"),
-            "version": extra.get("version"),
-            "chainId": chain_id,
-            "verifyingContract": asset,
-        },
-        "message": {
-            "from": wallet_address,
-            "to": pay_to,
-            "value": amount,
-            "validAfter": valid_after,
-            "validBefore": valid_before,
-            "nonce": nonce,
-        },
+    # P5 — sign the EIP-712 TransferWithAuthorization with the SELECTED backend.
+    message_types = {
+        "TransferWithAuthorization": [
+            {"name": "from", "type": "address"},
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "validAfter", "type": "uint256"},
+            {"name": "validBefore", "type": "uint256"},
+            {"name": "nonce", "type": "bytes32"},
+        ]
     }
-    sign_res = privy_rpc(
-        wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typed_data}}
-    )
-    signature = (sign_res or {}).get("data", {}).get("signature")
-    if not signature:
-        raise ToolError(
-            f"Privy did not return a signature for the x402 payment. Raw: {json.dumps(sign_res)[:400]}"
+    domain_data = {
+        "name": extra.get("name"),
+        "version": extra.get("version"),
+        "chainId": chain_id,
+        "verifyingContract": asset,
+    }
+    if b == "privy":
+        # NOTE: Privy's wallet-RPC typed_data schema is snake_case all the way down — the
+        # primary type field is `primary_type`, not the EIP-712 `primaryType` (see
+        # EthereumSignTypedDataRpcInput.Params.TypedData in @privy-io/node). The API
+        # rejects camelCase `primaryType` with a 400.
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                **message_types,
+            },
+            "primary_type": "TransferWithAuthorization",
+            "domain": domain_data,
+            "message": {
+                "from": wallet_address,
+                "to": pay_to,
+                "value": amount,
+                "validAfter": valid_after,
+                "validBefore": valid_before,
+                "nonce": nonce,
+            },
+        }
+        sign_res = privy_rpc(
+            wid, {"method": "eth_signTypedData_v4", "params": {"typed_data": typed_data}}
+        )
+        signature = (sign_res or {}).get("data", {}).get("signature")
+        if not signature:
+            raise ToolError(
+                f"Privy did not return a signature for the x402 payment. Raw: {json.dumps(sign_res)[:400]}"
+            )
+    else:  # eoa — sign locally with eth-account (uint256 as int, bytes32 nonce as bytes).
+        signature = _eoa_sign_typed(
+            domain_data,
+            message_types,
+            {
+                "from": wallet_address,
+                "to": pay_to,
+                "value": int(amount),
+                "validAfter": int(valid_after),
+                "validBefore": int(valid_before),
+                "nonce": bytes.fromhex(nonce[2:]),
+            },
         )
 
     # P6 — build the payment payload and base64-encode it.
@@ -873,10 +1037,23 @@ def abi_encode_impl(function_signature: str, args: list[Any]) -> str:
 
 
 @mcp.tool()
+def wallet_address(backend: str | None = None) -> str:
+    """Resolve the OPERATING wallet address and report which signing backend is active —
+    the backend-agnostic entry point the skill should use so it never assumes a wallet type.
+    `backend` (or $WALLET_BACKEND) is 'privy' (Privy agentic wallet; address from the Privy
+    API) or 'eoa' (raw EOA; address derived from WALLET_PRIVATE_KEY, else EVM_WALLET_ADDRESS).
+    If unset and exactly one backend is configured it is auto-selected; if BOTH are configured
+    you MUST choose (the user decides which wallet signs). Returns {address, backend}."""
+    b = resolve_backend(backend)
+    return dump({"address": get_wallet_address(backend=b), "backend": b})
+
+
+@mcp.tool()
 def privy_get_wallet_address(walletId: str | None = None) -> str:
-    """Resolve the agent wallet address. Returns $EVM_WALLET_ADDRESS if set,
-    otherwise looks up the Privy server wallet by id. Replaces aura's
-    get_wallet_address / 'resolve the wallet address' curl."""
+    """Privy-specific wallet-address resolver (the 'privy' backend). Looks up the Privy
+    server wallet by id ($PRIVY_WALLET_ID unless overridden); with no Privy wallet configured
+    it falls back to $EVM_WALLET_ADDRESS. For a backend-agnostic lookup that also reports the
+    active backend, prefer wallet_address. Returns {address, walletId}."""
     address = get_wallet_address(walletId)
     return dump({"address": address, "walletId": walletId or env("PRIVY_WALLET_ID")})
 
@@ -1015,6 +1192,46 @@ def _chain_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
     return j["result"]
 
 
+def _int_of(x: Any) -> int:
+    """Parse a wei/gas value that may be decimal or 0x-hex into an int."""
+    s = str(x).strip()
+    return int(s, 16) if s.lower().startswith("0x") else int(s)
+
+
+def _compute_tx_params(
+    sender: str,
+    to: str,
+    data: str | None,
+    value: str | None,
+    rpc: str,
+    gas_limit: str | None,
+) -> tuple[int, str, str]:
+    """Shared EIP-1559 tx prep used by BOTH signing backends (Privy raw + EOA): resolve
+    the live `pending` nonce (keeps the call re-runnable after a stuck attempt), the hex
+    `value`, and a gas limit. An explicit gasLimit wins; otherwise estimate with a 20%
+    buffer (a flat default is unsafe — a transfer is ~51k but mintAndCreateAccount is much
+    heavier, so a fixed cap silently reverts OUT-OF-GAS; an eth_call sim can still PASS in
+    that window, so eth_estimateGas is the real check), falling back to 400k. Returns
+    (nonce, value_hex, gas_limit_hex)."""
+    nonce = int(_chain_rpc(rpc, "eth_getTransactionCount", [sender, "pending"]), 16)
+    val = "0x0"
+    if value:
+        v = str(value).strip()
+        val = v if v.startswith("0x") else hex(int(v))
+    if gas_limit:
+        gas_limit_hex = gas_limit
+    else:
+        est_call: dict[str, Any] = {"from": sender, "to": to, "value": val}
+        if data:
+            est_call["data"] = data
+        try:
+            est = int(_chain_rpc(rpc, "eth_estimateGas", [est_call]), 16)
+            gas_limit_hex = hex(est * 12 // 10)  # ×1.2 buffer
+        except ToolError:
+            gas_limit_hex = "0x61a80"  # 400000 fallback (covers mint ~176k + transfers)
+    return nonce, val, gas_limit_hex
+
+
 @mcp.tool()
 def privy_send_raw_transaction(
     to: str,
@@ -1057,30 +1274,8 @@ def privy_send_raw_transaction(
     if not sender:
         raise ToolError(f"Could not resolve signer address for Privy wallet {wid}.")
 
-    # Live pending nonce keeps the tool re-runnable after a stuck/failed attempt.
-    nonce = int(_chain_rpc(rpc, "eth_getTransactionCount", [sender, "pending"]), 16)
-
-    val = "0x0"
-    if value:
-        v = str(value).strip()
-        val = v if v.startswith("0x") else hex(int(v))
-
-    # Gas limit: an explicit override wins; otherwise estimate with a 20% buffer.
-    # A flat default is unsafe — a transfer is ~51k but mintAndCreateAccount (mint +
-    # TBA provisioning) is much heavier, so a fixed cap silently reverts OUT-OF-GAS.
-    # Note that an eth_call simulation can still PASS in that window (it assumes a
-    # high gas cap), so it is a misleading signal — eth_estimateGas is the real check.
-    if gasLimit:
-        gas_limit_hex = gasLimit
-    else:
-        est_call: dict[str, Any] = {"from": sender, "to": to, "value": val}
-        if data:
-            est_call["data"] = data
-        try:
-            est = int(_chain_rpc(rpc, "eth_estimateGas", [est_call]), 16)
-            gas_limit_hex = hex(est * 12 // 10)  # ×1.2 buffer
-        except ToolError:
-            gas_limit_hex = "0x61a80"  # 400000 fallback (covers mint ~176k + transfers)
+    # Shared prep: live pending nonce (re-runnable), hex value, estimated gas.
+    nonce, val, gas_limit_hex = _compute_tx_params(sender, to, data, value, rpc, gasLimit)
 
     transaction: dict[str, Any] = {
         "to": to,
@@ -1106,6 +1301,55 @@ def privy_send_raw_transaction(
         raise ToolError(f"Privy returned no signed_transaction. Raw: {json.dumps(res)[:400]}")
 
     tx_hash = _chain_rpc(rpc, "eth_sendRawTransaction", [signed])
+    return dump({"txHash": tx_hash, "nonce": nonce, "from": sender, "gasLimit": gas_limit_hex})
+
+
+@mcp.tool()
+def eoa_send_transaction(
+    to: str,
+    data: str | None = None,
+    value: str | None = None,
+    chainId: str | None = None,
+    rpcUrl: str | None = None,
+    gasLimit: str | None = None,
+    maxFeePerGas: str | None = None,
+    maxPriorityFeePerGas: str | None = None,
+) -> str:
+    """Raw-EOA analogue of privy_send_transaction / privy_send_raw_transaction: sign a
+    transaction LOCALLY with WALLET_PRIVATE_KEY (eth-account) and broadcast it via
+    eth_sendRawTransaction. Use this for EVERY on-chain write when the operating wallet is a
+    raw EOA (the 'eoa' backend) — the LabNFT mint (mintAndCreateAccount, value=mintFeeWei),
+    AccessResolver grantRole, AND the LabNFT safeTransferFrom hand-off (an EOA self-broadcasts,
+    so there is no Privy 'phantom hash' to work around — one tool covers all three, unlike the
+    two Privy tools). The private key never leaves this process. Resolves the live `pending`
+    nonce (re-runnable); gas auto-estimated (×1.2) unless gasLimit is passed; EIP-1559 fees
+    default to 5/2 gwei. value is decimal wei (or 0x hex). rpcUrl falls back to EVM_RPC_URL
+    then a public node for known chains. Returns {txHash, nonce, from, gasLimit}."""
+    acct = _eoa_account()
+    sender = acct.address
+    cid = str(chainId or env("CHAIN_ID") or "")
+    if not cid:
+        raise ToolError("chainId not provided and CHAIN_ID is not set.")
+    rpc = rpcUrl or env("EVM_RPC_URL") or _DEFAULT_RPC_BY_CHAIN.get(cid)
+    if not rpc:
+        raise ToolError(
+            f"No EVM RPC endpoint for chainId {cid}. Pass rpcUrl or set EVM_RPC_URL."
+        )
+    nonce, val, gas_limit_hex = _compute_tx_params(sender, to, data, value, rpc, gasLimit)
+    # eth-account wants a standard (camelCase) tx dict with int values.
+    transaction: dict[str, Any] = {
+        "to": to,
+        "value": int(val, 16),
+        "gas": int(gas_limit_hex, 16),
+        "maxFeePerGas": _int_of(maxFeePerGas or "0x12a05f200"),  # 5 gwei
+        "maxPriorityFeePerGas": _int_of(maxPriorityFeePerGas or "0x77359400"),  # 2 gwei
+        "nonce": nonce,
+        "chainId": int(cid),
+        "type": 2,
+    }
+    if data:
+        transaction["data"] = data
+    tx_hash = _eoa_sign_and_send(transaction, rpc)
     return dump({"txHash": tx_hash, "nonce": nonce, "from": sender, "gasLimit": gas_limit_hex})
 
 
@@ -1139,18 +1383,22 @@ def x402_pay(
     variables: dict | None = None,
     gatewayUrl: str | None = None,
     walletId: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """Run the entire x402 payment flow (P1–P7) for ONE whitelisted mutation in a
     single call: send -> decode the payment-required challenge -> sign the EIP-712
-    TransferWithAuthorization with the Privy wallet -> retry with PAYMENT-SIGNATURE.
-    The single top-level GraphQL field in `query` MUST equal `mutation` (the
-    gateway's validateMutationQuery enforces this). Returns {data, errors, settlement}.
-    Whitelisted mutations: initiateCreateOrUpdateFile,
+    TransferWithAuthorization with the SELECTED wallet backend -> retry with PAYMENT-SIGNATURE.
+    `backend` (or $WALLET_BACKEND) picks the signer: 'privy' (Privy agentic wallet, signs via
+    the Privy API) or 'eoa' (raw EOA, signs locally with WALLET_PRIVATE_KEY). If unset and one
+    backend is configured it is auto-selected; if both are configured you must choose. Either
+    way the paying wallet needs USDC on the x402 settlement chain. The single top-level GraphQL
+    field in `query` MUST equal `mutation` (the gateway's validateMutationQuery enforces this).
+    Returns {data, errors, settlement}. Whitelisted mutations: initiateCreateOrUpdateFile,
     finishCreateOrUpdateFile, createAnnouncement, createLab, generateDataEncryptionKey,
     decryptDataKey (any other mutation 400s with 'not enabled for x402 gateway'). Send the
     TOP-LEVEL AppSync mutations (not the nested molecule.v3.project(oclId) Kamu documents).
     All data-room args are keyed on oclId (the lab's bytes32 id)."""
-    return dump(run_x402_pay(mutation, query, variables, gatewayUrl, walletId))
+    return dump(run_x402_pay(mutation, query, variables, gatewayUrl, walletId, backend))
 
 
 @mcp.tool()
@@ -1184,6 +1432,7 @@ def labs_generate_dek(
     gatewayUrl: str | None = None,
     labsUrl: str | None = None,
     walletId: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """Call generateDataEncryptionKey and KEEP the plaintext DEK inside this
     server. Returns {encryptedDek, encryptionSystem, dekHandle} — pass dekHandle to
@@ -1196,7 +1445,7 @@ def labs_generate_dek(
         "plaintextDEK encryptedDek encryptionSystem error { message code retryable } } }"
     )
     if transport == "x402":
-        r = run_x402_pay("generateDataEncryptionKey", query, {}, gatewayUrl, walletId)
+        r = run_x402_pay("generateDataEncryptionKey", query, {}, gatewayUrl, walletId, backend)
         if r.get("errors"):
             raise ToolError(f"generateDataEncryptionKey errors: {json.dumps(r['errors'])[:400]}")
         result = (r.get("data") or {}).get("generateDataEncryptionKey")
@@ -1232,6 +1481,7 @@ def labs_decrypt_dek(
     walletId: str | None = None,
     serviceToken: str | None = None,
     walletAddress: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """Call decryptDataKey (the backend evaluates access for the caller) and KEEP the
     plaintext DEK inside this server. Returns {iv, dekHandle, message} — pass dekHandle
@@ -1271,7 +1521,7 @@ def labs_decrypt_dek(
         "{ isSuccess plaintextDEK iv message error { message code retryable } } }"
     )
     if transport == "x402":
-        r = run_x402_pay("decryptDataKey", query, variables, gatewayUrl, walletId)
+        r = run_x402_pay("decryptDataKey", query, variables, gatewayUrl, walletId, backend)
         result = (r.get("data") or {}).get("decryptDataKey")
     else:
         r = labs_graphql_call(
@@ -1569,7 +1819,9 @@ def issue_owner_service_token(
 
 # ---- configuration diagnostics ------------------------------------------
 
-# (name, is_secret, purpose) — the env vars the molecule flows read.
+# (name, is_secret, purpose) — the env vars the molecule flows read. Wallet creds are
+# OPTIONAL: you configure exactly ONE backend (Privy agentic wallet OR raw EOA), or both
+# and select with WALLET_BACKEND. Nothing here is required until you pick a wallet.
 _ENV_CATALOG: list[tuple[str, bool, str]] = [
     ("MOLECULE_LABS_URL", False, "Labs GraphQL endpoint (OCL/V3 surface)"),
     ("MOLECULE_CLIENT_URL", False, "Client base URL for project links"),
@@ -1579,21 +1831,22 @@ _ENV_CATALOG: list[tuple[str, bool, str]] = [
     ("X402_GATEWAY_URL", False, "x402 paid-mutation gateway"),
     ("CHAIN_ID", False, "OCL chain id (84532 Base Sepolia / 8453 Base)"),
     ("EVM_RPC_URL", False, "Base RPC for ocl_read + raw broadcast (optional)"),
-    ("EVM_WALLET_ADDRESS", False, "Owner / hand-off wallet (optional)"),
-    ("PRIVY_APP_ID", True, "Privy app id — wallet ops + x402"),
-    ("PRIVY_APP_SECRET", True, "Privy app secret — wallet ops + x402"),
-    ("PRIVY_WALLET_ID", True, "Privy agentic wallet id"),
+    ("WALLET_BACKEND", False, "Wallet backend selector: 'privy' | 'eoa' (optional; auto if one configured)"),
+    ("EVM_WALLET_ADDRESS", False, "EOA address — watch-only reads / Phase-5 owner-handoff target (optional)"),
+    ("PRIVY_APP_ID", True, "[privy backend] Privy app id — agentic wallet ops + x402 (optional)"),
+    ("PRIVY_APP_SECRET", True, "[privy backend] Privy app secret — agentic wallet ops + x402 (optional)"),
+    ("PRIVY_WALLET_ID", True, "[privy backend] Privy agentic wallet id (optional)"),
     ("MOLECULE_API_KEY", True, "x-api-key for direct Labs reads"),
     ("MOLECULE_SERVICE_TOKEN", True, "Service JWT for private/encrypted DEK calls"),
-    ("WALLET_PRIVATE_KEY", True, "Owner EOA key (only for issue_owner_service_token)"),
+    ("WALLET_PRIVATE_KEY", True, "[eoa backend] Raw EOA private key — local signer for x402 / mint / grant / transfer / service token (optional)"),
 ]
 
-# Per-flow required vars, for a quick readiness verdict.
+# Per-flow required NON-wallet vars, for a quick readiness verdict. Wallet readiness is
+# reported separately (walletBackends) because either backend satisfies the spending flows.
 _FLOW_REQUIREMENTS: list[tuple[str, list[str]]] = [
-    ("privy_wallet_ops", ["PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID"]),
-    ("x402_mutations", ["X402_GATEWAY_URL", "PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID", "CHAIN_ID"]),
-    ("onchain_lab", ["ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
     ("labs_reads", ["MOLECULE_LABS_URL", "MOLECULE_API_KEY"]),
+    ("onchain_lab", ["ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
+    ("x402_mutations", ["X402_GATEWAY_URL", "CHAIN_ID"]),  # + any one wallet backend
     ("private_encrypted_upload", ["MOLECULE_SERVICE_TOKEN", "MOLECULE_API_KEY"]),
 ]
 
@@ -1636,9 +1889,36 @@ def config_doctor(showValues: bool = True) -> str:
         missing = [r for r in required if not os.environ.get(r)]
         flows.append({"flow": flow, "ready": not missing, "missing": missing})
 
-    core_ready = all(
-        f["ready"] for f in flows if f["flow"] in ("privy_wallet_ops", "x402_mutations", "onchain_lab")
+    # Wallet readiness is per-backend — the user picks ONE (or sets WALLET_BACKEND to
+    # disambiguate). Spending flows are ready as long as some backend is usable.
+    avail = available_backends()
+    explicit_backend = env("WALLET_BACKEND")
+    wallet_backends = {
+        "available": avail,
+        "selected": explicit_backend or (avail[0] if len(avail) == 1 else None),
+        "explicit": explicit_backend or None,
+        "needsChoice": len(avail) > 1 and not explicit_backend,
+        "perBackend": {
+            "privy": {
+                "ready": _privy_wallet_present(),
+                "missing": [
+                    v for v in ("PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID")
+                    if not os.environ.get(v)
+                ],
+            },
+            "eoa": {
+                "ready": _eoa_key_present(),
+                "missing": [] if _eoa_key_present() else ["WALLET_PRIVATE_KEY"],
+            },
+        },
+    }
+
+    flows_ready = all(
+        f["ready"] for f in flows if f["flow"] in ("x402_mutations", "onchain_lab")
     )
+    # Core is ready when the non-wallet spending flows are set AND at least one wallet
+    # backend is usable AND (if both are configured) a choice has been made.
+    core_ready = bool(avail) and flows_ready and not wallet_backends["needsChoice"]
     try:
         global_excluded = str((Path.home() / ".claude").resolve())
     except Exception:
@@ -1650,12 +1930,17 @@ def config_doctor(showValues: bool = True) -> str:
             "configFilesLoaded": _CONFIG_FILES_LOADED or ["(none)"],
             "globalSettingsExcluded": global_excluded,
             "envVars": vars_report,
+            "walletBackends": wallet_backends,
             "flows": flows,
             "note": (
-                "Env is loaded from process env (harness) first, then the nearest "
-                "project-base .claude/settings.local.json (secrets) + settings.json "
-                "(non-secrets); global ~/.claude is excluded. To fix a missing var, set "
-                "it in the projectBase files above, then reload the MCP (/mcp)."
+                "Wallet creds are OPTIONAL and you are in control of which wallet signs: "
+                "configure the Privy agentic wallet (PRIVY_APP_ID + PRIVY_APP_SECRET + "
+                "PRIVY_WALLET_ID) OR a raw EOA (WALLET_PRIVATE_KEY) — see walletBackends. With "
+                "both configured, set WALLET_BACKEND=privy|eoa to choose. Env is loaded from "
+                "process env (harness) first, then the nearest project-base "
+                ".claude/settings.local.json (secrets) + settings.json (non-secrets); global "
+                "~/.claude is excluded. To fix a missing var, set it in the projectBase files "
+                "above, then reload the MCP (/mcp)."
             ),
         }
     )

@@ -12,9 +12,11 @@ metadata:
     - EVM_WALLET_ADDRESS
     - EVM_RPC_URL
     - CHAIN_ID
+    - WALLET_BACKEND
     - PRIVY_APP_ID
     - PRIVY_APP_SECRET
     - PRIVY_WALLET_ID
+    - WALLET_PRIVATE_KEY
     - MOLECULE_API_KEY
     - MOLECULE_SERVICE_TOKEN
 ---
@@ -38,7 +40,8 @@ non-MCP tools used are `read_file` (PDF text extraction), `shared_cache` (cross-
 - Do NOT `read_file` on image/binary attachments (PNG, JPG, etc.). The upload flow only needs the `file_path` — pass the path directly to `mcp__molecule__s3_upload`.
 - Use `shared_cache` to persist all critical values (`oclId`, `labAccountAddress`, `labNftTokenId`, tx hashes, tokens, the `dekHandle`). If you need a value from an earlier step, retrieve it from cache.
 - Follow every URL, contract address, and function signature in this document EXACTLY. Do NOT guess or fabricate alternatives. URLs and contract addresses come from `.env`, read by the MCP — never hardcode.
-- Use the x402 payment flow for ALL Molecule mutations (createLab, file uploads, announcements) via `mcp__molecule__x402_pay` — one call runs the whole P1–P7 handshake. Send the **top-level AppSync** mutations (not the nested `molecule.v3.project(oclId)` documents).
+- **WALLET BACKEND — the user is in control; you NEVER assume one.** There are two operating-wallet backends and **all** their env vars are optional until the user picks: (1) a **Privy agentic wallet** (signs server-side via Privy — `PRIVY_APP_ID` + `PRIVY_APP_SECRET` + `PRIVY_WALLET_ID`), or (2) a **raw EOA** (signs locally in the MCP with `WALLET_PRIVATE_KEY` — Privy never exposes a key, so the two are NOT interchangeable). **Ask the user which wallet to use** (Phase 0), then pin it for the whole run via `WALLET_BACKEND=privy|eoa` (or the per-call `backend` arg). If exactly one backend is configured the MCP auto-selects it; if BOTH are configured you MUST pass the user's choice — the MCP refuses to guess. Every signing/sending tool follows this choice: **Privy →** `privy_send_transaction` / `privy_send_raw_transaction` / `issue_service_token`; **EOA →** `eoa_send_transaction` / `issue_owner_service_token`. `x402_pay` and `wallet_address` work for either.
+- Use the x402 payment flow for ALL Molecule mutations (createLab, file uploads, announcements) via `mcp__molecule__x402_pay` — one call runs the whole P1–P7 handshake, signing with the **selected wallet backend**. Send the **top-level AppSync** mutations (not the nested `molecule.v3.project(oclId)` documents).
 - The lab is keyed on **`oclId`** (a 32-byte `0x` + 64-hex string), threaded through every backend call. Its **`labAccountAddress`** (the TBA) is threaded into the access-conditions step.
 - For **private / confidential** files, use the Private / Encrypted Upload variant in Phase 3 (Steps E0–E6) **instead of** the public Steps A–C: generate a one-shot DEK (kept inside the MCP), AES-256-GCM encrypt locally, upload the ciphertext, and finish with `encryptionMetadata` + a non-PUBLIC `accessLevel`. NEVER upload a confidential file as plaintext or with `accessLevel: PUBLIC`.
 - **FAIL CLOSED — no public fallback for confidential files.** Once a file is chosen for the Private / Encrypted variant, if **any** step (E0 DEK, E1 encrypt, E2/E3 ciphertext upload, E4 access conditions, E5 finalize, E6 verify) fails and you cannot fix it in-path, **ABORT the entire molecule and report the error.** Do **NOT** "recover" by running the public Steps A–C, re-upload with `accessLevel: PUBLIC`, or `s3_upload` the plaintext PDF — ever. This is also enforced in code: `encrypt_file` arms a non-overridable MCP guard that refuses to S3-upload that file's plaintext, and `build_access_conditions` arms a guard that refuses to finalize a file for that `oclId` as `PUBLIC` / without `encryptionMetadata`. Do not attempt to work around these guards.
@@ -46,7 +49,12 @@ non-MCP tools used are `read_file` (PDF text extraction), `shared_cache` (cross-
 - AES-256-GCM encrypt/decrypt is handled by `mcp__molecule__encrypt_file`/`decrypt_file` (it replicates the Labs `encryptFileWithKms`). PDF reading still uses `read_file`.
 - Phases executed sequentially without stopping or reporting intermediate progress.
 
-## Environment Variables — most are required for wallet management, authentication, and the on-chain lab. A required var, if missing, makes the relevant MCP tool terminate with an error naming it. **`WALLET_PRIVATE_KEY` is NOT required for the default flow** — the operating wallet is a Privy agentic wallet, so the skill issues its own service token via `mcp__molecule__issue_service_token` (no raw key). You only need `WALLET_PRIVATE_KEY` if the operating/owner wallet is a raw EOA signing through `mcp__molecule__issue_owner_service_token`.
+## Environment Variables — the lab/endpoint vars are required; the **wallet vars are all optional until the user picks a backend** (see the WALLET BACKEND rule above). A required var, if missing, makes the relevant MCP tool terminate with an error naming it. The MCP supports **two operating-wallet backends — the user chooses one:**
+
+- **Privy agentic wallet** (`PRIVY_APP_ID` + `PRIVY_APP_SECRET` + `PRIVY_WALLET_ID`): Privy signs server-side; no raw key exists. Service token via `mcp__molecule__issue_service_token`.
+- **Raw EOA** (`WALLET_PRIVATE_KEY`): the MCP signs locally (the key never leaves the process). Service token via `mcp__molecule__issue_owner_service_token`.
+
+Set `WALLET_BACKEND=privy|eoa` to pin the choice (auto-selected when only one is configured; **required** when both are). Run `mcp__molecule__config_doctor` to see the active backend and what each one still needs.
 
 | Variable | Description |
 |----------|-------------|
@@ -57,11 +65,13 @@ non-MCP tools used are `read_file` (PDF text extraction), `shared_cache` (cross-
 | `ACCESS_RESOLVER_ADDRESS` | **Required** — AccessResolver V3 (`hasRole` / `isAuthorizedSignerForTba` / `grantRole`). Not derivable on-chain (the resolver points to LabNFT, not vice-versa), so set it explicitly. |
 | `X402_GATEWAY_URL` | x402 paid-mutation gateway. |
 | `CHAIN_ID` | OCL canonical chain (Base Sepolia `84532` / Base `8453`). |
-| `EVM_RPC_URL` | **Optional, non-secret** (→ `settings.json`). Base / Base Sepolia RPC for `ocl_read` + raw broadcast. Falls back to a public node for known chains (`https://sepolia.base.org` / `https://mainnet.base.org`). Sensitive only if the URL embeds an API key. |
-| `EVM_WALLET_ADDRESS` | Owner's personal wallet for hand-off / co-ownership (optional — skip Phase 5 if not set). |
-| `PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` | Privy agentic wallet (every `mcp__molecule__privy_*` tool + x402). |
+| `EVM_RPC_URL` | **Optional, non-secret** (→ `settings.json`). Base / Base Sepolia RPC for `ocl_read` + raw broadcast (the EOA backend signs+broadcasts through it). Falls back to a public node for known chains (`https://sepolia.base.org` / `https://mainnet.base.org`). Sensitive only if the URL embeds an API key. |
+| `WALLET_BACKEND` | **Optional wallet selector — `privy` or `eoa`.** Pins which backend signs for the whole run. Auto-selected when exactly one backend's env is set; **required when both are** (the MCP refuses to guess). |
+| `EVM_WALLET_ADDRESS` | EOA address for **watch-only reads** and the **Phase-5 owner / hand-off target** (optional — skip Phase 5 if not set or equal to the operating wallet). Under the **privy** backend this is NOT the operating signer. |
+| `PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` | **Privy backend (optional).** Privy agentic wallet — `mcp__molecule__privy_*` tools + x402 + `issue_service_token`. |
+| `WALLET_PRIVATE_KEY` | **EOA backend (optional, secret).** Raw EOA private key — the MCP's **local** signer for `eoa_send_transaction`, x402 payments, and `issue_owner_service_token`. The key never leaves the MCP process. Needed only when `WALLET_BACKEND=eoa` (or the EOA is the only configured wallet). |
 | `MOLECULE_API_KEY` | `x-api-key` for direct `labs_graphql` reads (e.g. the `labs(walletAddress)` resolve query). |
-| `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** Off-chain JWT for the direct (non-x402) DEK generate/decrypt calls, bound to one wallet's `adminAddress`. If missing/expired, issue one bound to the operating wallet (see **Service Token**). Secret — keep in `settings.local.json`. |
+| `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** Off-chain JWT for the direct (non-x402) DEK generate/decrypt calls, bound to one wallet's `adminAddress`. If missing/expired, issue one bound to the operating wallet — Privy via `issue_service_token`, EOA via `issue_owner_service_token` (see **Service Token**). Secret — keep in `settings.local.json`. |
 
 **Note:** The MCP server reads all URLs, contract addresses, API keys, and secrets from the environment
 (`.claude/settings.json` for non-secrets, `.claude/settings.local.json` for secrets). The skill passes only
@@ -81,14 +91,21 @@ staging and production is a `.env` edit only — never modify the skill body for
 
 Before Phase 0, ask the user — in a single prompt (e.g. `AskUserQuestion`) — for:
 
-1. **Upload visibility — public or private/encrypted** — the Phase 3 path selector. Present **public** as the pre-selected default but require the user to confirm. `public` → Phase 3 Steps A–C; `private/encrypted` → Phase 3 Private variant Steps E0–E6 (also needs `MOLECULE_SERVICE_TOKEN`).
-2. **Confirm the lab name, symbol, and description** you auto-drafted from the document (the user may override). These are the only lab metadata fields (`UpdateLabNftMetadataInput`: name / description / image / externalUrl) — there is no research-lead / organization / funding metadata on an OCL lab.
+1. **Wallet backend — Privy agentic wallet or raw EOA** — the operating wallet that signs every on-chain tx and x402 payment. **You MUST ask; never assume.** If `config_doctor` shows exactly one backend configured, present that as the pre-selected default but still confirm; if both are configured, the user MUST pick (the MCP will not guess). Record the choice and use it for the whole run (pass it as `backend` where a tool accepts it, and treat `WALLET_BACKEND` as the source of truth). `privy` → Phase 0 Privy variant (Steps 0a–0d); `eoa` → Phase 0 EOA variant (Step 0e).
+2. **Upload visibility — public or private/encrypted** — the Phase 3 path selector. Present **public** as the pre-selected default but require the user to confirm. `public` → Phase 3 Steps A–C; `private/encrypted` → Phase 3 Private variant Steps E0–E6 (also needs `MOLECULE_SERVICE_TOKEN`).
+3. **Confirm the lab name, symbol, and description** you auto-drafted from the document (the user may override). These are the only lab metadata fields (`UpdateLabNftMetadataInput`: name / description / image / externalUrl) — there is no research-lead / organization / funding metadata on an OCL lab.
 
 Once gathered, run Phases 0–5 as one uninterrupted sequence.
 
 ## Phase 0: Wallet Setup
 
-Before starting, verify a Privy agentic wallet is available. If available, save its address. If not, create one with a restrictive policy and report the new wallet id.
+Set up the **operating wallet for the backend the user chose** (Collect-run-inputs Q1). Run **the Privy variant (Steps 0a–0d) OR the EOA variant (Step 0e) — not both.** Either way, end Phase 0 with a saved `wallet_address` (the operating signer) and a known backend. A quick `mcp__molecule__config_doctor` first confirms which backends are configured and which is selected.
+
+> Whichever backend is active, get the operating address with the backend-agnostic `mcp__molecule__wallet_address` (it returns `{address, backend}`) and `shared_cache` both `wallet_address` and `wallet_backend`. Pass `backend: <wallet_backend>` to any tool that accepts it so the run never drifts to the wrong wallet.
+
+### Privy variant (Steps 0a–0d) — `WALLET_BACKEND=privy`
+
+Verify a Privy agentic wallet is available. If available, save its address. If not, create one with a restrictive policy and report the new wallet id.
 
 ### Step 0a — Check for existing wallet
 ```
@@ -117,6 +134,17 @@ mcp__molecule__privy_create_wallet:
   policyIds: ["<policyId>"]
 ```
 Save `walletId` as `wallet_id` and `address` as `wallet_address`. Report that the user must set `PRIVY_WALLET_ID=<wallet_id>` for the Privy MCP tools to function. Save wallet details to `lab/wallet_info.json`.
+
+### EOA variant (Step 0e) — `WALLET_BACKEND=eoa`
+
+The user is bringing their **own EOA** (an external/personal key). There is **no wallet to create or policy to attach** — the MCP signs locally with `WALLET_PRIVATE_KEY` (the key never leaves the MCP process). Just confirm the wallet resolves:
+```
+mcp__molecule__wallet_address:
+  backend: eoa
+```
+Save the returned `address` as `wallet_address`. If this errors with "WALLET_PRIVATE_KEY is not set", the user has chosen the EOA backend without providing the key — stop and ask them to set `WALLET_PRIVATE_KEY` (secret → `settings.local.json`) and, if desired, `WALLET_BACKEND=eoa`, then reload the MCP. **Fund this EOA** before the paid phases: USDC on the x402 settlement chain (x402 pays per call) + native gas on the mint chain. Then proceed to Phase 1.
+
+> **Combining a wallet later.** Because the backend is purely an env choice, a user can run today on whichever wallet they have and switch later with **no skill change** — e.g. start on an EOA, then later create/fund a Privy agentic wallet (Steps 0a–0d) and set `WALLET_BACKEND=privy`, or vice-versa. The same lab, files, and access grants keep working; only the signer changes. To give a *second* wallet access to an existing lab, use Phase 5 (grantRole / transfer).
 
 ## Phase 1: Resolve-or-create the On-Chain Lab
 
@@ -147,7 +175,7 @@ mcp__molecule__labs_graphql:
 - If `totalCount == 0`: **MINT** a new lab (Step 1b).
 
 ### Step 1b — Mint a new LabNFT + token-bound account
-Read the mint fee, then mint via the factory (mint + TBA creation in one tx). `privy_send_transaction` is correct here — Privy broadcasts the mint and estimates gas.
+Read the mint fee, then mint via the factory (mint + TBA creation in one tx).
 ```
 mcp__molecule__ocl_read:
   functionSignature: "mintFeeWei()"
@@ -160,9 +188,19 @@ mcp__molecule__abi_encode:
   functionSignature: "mintAndCreateAccount(address)"
   args: ["<wallet_address>"]
 ```
-Save `calldata`.
+Save `calldata`. Now send the mint **with the selected wallet backend**:
+
+- **Privy** (`backend=privy`) — `privy_send_transaction` (Privy broadcasts the mint and estimates gas):
 ```
 mcp__molecule__privy_send_transaction:
+  to: $ONCHAIN_LAB_FACTORY_ADDRESS
+  data: <calldata>
+  value: "<mint_fee_wei>"
+  chainId: $CHAIN_ID
+```
+- **EOA** (`backend=eoa`) — `eoa_send_transaction` (the MCP signs locally with `WALLET_PRIVATE_KEY` and self-broadcasts; same args):
+```
+mcp__molecule__eoa_send_transaction:
   to: $ONCHAIN_LAB_FACTORY_ADDRESS
   data: <calldata>
   value: "<mint_fee_wei>"
@@ -212,17 +250,18 @@ shared_cache: { "operation": "put", "namespace": "molecule", "key": "wallet_addr
 ## x402 Payment Flow (used by the paid mutations in Phases 2–4)
 
 Each paid Molecule mutation is settled per call in USDC on Base. The entire P1–P7 handshake (send → decode
-the `payment-required` challenge → sign the EIP-712 `TransferWithAuthorization` with the Privy wallet → retry
-with `PAYMENT-SIGNATURE`) runs **inside one `mcp__molecule__x402_pay` call**:
+the `payment-required` challenge → sign the EIP-712 `TransferWithAuthorization` with the **selected wallet
+backend** (Privy wallet or local EOA) → retry with `PAYMENT-SIGNATURE`) runs **inside one
+`mcp__molecule__x402_pay` call**:
 ```
 mcp__molecule__x402_pay:
   mutation: <mutation_name>
   query: "<the GraphQL mutation — its single top-level field MUST equal `mutation`>"
   variables: { ... }
 ```
-It returns `{ data, errors, settlement }`; read `data.<mutation_name>` and check `isSuccess` / `error`.
+It returns `{ data, errors, settlement }`; read `data.<mutation_name>` and check `isSuccess` / `error`. `x402_pay` signs with the **selected wallet backend** — pass `backend: <wallet_backend>` if both backends are configured.
 
-**Required env vars (read by the MCP):** `X402_GATEWAY_URL`, `PRIVY_APP_ID`, `PRIVY_APP_SECRET`, `PRIVY_WALLET_ID`.
+**Required env vars (read by the MCP):** `X402_GATEWAY_URL`, `CHAIN_ID`, **plus the chosen wallet backend** — either Privy (`PRIVY_APP_ID` + `PRIVY_APP_SECRET` + `PRIVY_WALLET_ID`) or EOA (`WALLET_PRIVATE_KEY`). The paying wallet must hold USDC on the settlement chain regardless of backend.
 
 ### Whitelisted mutations (OCL surface, keyed on `oclId`)
 The x402 gateway whitelist is exactly:
@@ -485,8 +524,9 @@ mcp__molecule__abi_encode:
   functionSignature: "grantRole(bytes32,address,uint8,uint64,bool)"
   args: ["<oclId>", "<owner_wallet>", 2, 0, false]
 ```
+Send with the active backend — **Privy →** `privy_send_transaction`, **EOA →** `eoa_send_transaction` (same args):
 ```
-mcp__molecule__privy_send_transaction:
+mcp__molecule__privy_send_transaction:   # OR mcp__molecule__eoa_send_transaction (backend=eoa)
   to: $ACCESS_RESOLVER_ADDRESS
   data: <calldata>
   chainId: $CHAIN_ID
@@ -496,14 +536,23 @@ Save `txHash` as `grant_tx_hash`.
 **Verify + indexing caveat (important).** The grant is effective **on-chain** immediately — confirm with `mcp__molecule__ocl_read: { functionSignature: "hasRole(bytes32,address,uint8)", to: $ACCESS_RESOLVER_ADDRESS, args: ["<oclId>", "<owner_wallet>", 2], returns: ["bool"] }` → `true`. But decryption ALSO needs the DB `authorizeViewer` gate, which reads an **indexed** `ocl_user` table populated by the AccessResolver `RoleGranted` replay (`ocl-processor`), NOT the chain directly. That indexer can **lag badly**: on the `migration`/pre-prod stack a fresh grant was observed to NOT materialize for 18+ minutes (the replay seeds from `l2StartBlock`, distinct from the fast `onchain_event` owner indexer). So the grantee can get `AUTH_FAILED` ("not authorized as viewer") from `decryptDataKey` for a long time even though `hasRole` is already `true`. To check readiness, test `labs_decrypt_dek` as the grantee (a service token bound to that wallet). If it keeps returning `AUTH_FAILED` long after the grant, the AccessResolver indexer is behind for this environment — use **Option B (transfer)** for prompt decrypt access, or flag the backend; do NOT re-grant (the on-chain state is already correct).
 
 ### Option B — Transfer the LabNFT (true hand-off; the agent LOSES control)
-Only when the owner should fully take over. After transfer the new holder is the TBA owner and the agent can no longer admin or decrypt. **Never transfer to the lab's own TBA (`labAccountAddress`) — the contract reverts.** Use `privy_send_raw_transaction` (Privy's `eth_sendTransaction` returns a phantom hash for `safeTransferFrom`):
+Only when the owner should fully take over. After transfer the new holder is the TBA owner and the agent can no longer admin or decrypt. **Never transfer to the lab's own TBA (`labAccountAddress`) — the contract reverts.**
 ```
 mcp__molecule__abi_encode:
   functionSignature: "safeTransferFrom(address,address,uint256)"
   args: ["<wallet_address>", "<owner_wallet>", "<labNftTokenId>"]
 ```
+Send with the active backend:
+- **Privy** (`backend=privy`) — use `privy_send_raw_transaction` (Privy's `eth_sendTransaction` returns a *phantom hash* for `safeTransferFrom`, so the sign-only + self-broadcast path is required):
 ```
 mcp__molecule__privy_send_raw_transaction:
+  to: <lab_nft_address>
+  data: <calldata>
+  chainId: $CHAIN_ID
+```
+- **EOA** (`backend=eoa`) — use `eoa_send_transaction` (an EOA already signs locally and self-broadcasts, so there is no phantom-hash workaround; same args):
+```
+mcp__molecule__eoa_send_transaction:
   to: <lab_nft_address>
   data: <calldata>
   chainId: $CHAIN_ID

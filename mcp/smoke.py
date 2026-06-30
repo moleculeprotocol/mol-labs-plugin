@@ -33,6 +33,17 @@ async def main() -> None:
         args=[str(HERE / "server.py")],
         env={
             **os.environ,
+            # Neutralize wallet/secret env so this stays genuinely offline (no Privy
+            # network call) even on a dev box whose project-base .claude carries secrets.
+            # Empty-string keys are "present" so the server's bootstrap won't reload the
+            # real values, yet env() treats them as unset — leaving NO signing backend
+            # configured, which is exactly the watch-only path we assert below.
+            "PRIVY_APP_ID": "",
+            "PRIVY_APP_SECRET": "",
+            "PRIVY_WALLET_ID": "",
+            "WALLET_PRIVATE_KEY": "",
+            "WALLET_BACKEND": "",
+            "MOLECULE_SERVICE_TOKEN": "",
             "EVM_WALLET_ADDRESS": "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c",
             "ACCESS_RESOLVER_ADDRESS": "0x5493F472602C87318EA5Eff753cDD593bf9bF559",
             "ONCHAIN_LAB_FACTORY_ADDRESS": "0xd629FE2310b4309a212495F10A47f8436dcEfD90",
@@ -60,8 +71,14 @@ async def main() -> None:
                 present = gone in tool_names
                 ok &= not present
                 print(f"removed {gone}:", not present)
-            # New OCL primitives must be present.
-            for needed in ("ocl_read", "ocl_tx_identity", "build_access_conditions"):
+            # New OCL primitives + dual-backend wallet tools must be present.
+            for needed in (
+                "ocl_read",
+                "ocl_tx_identity",
+                "build_access_conditions",
+                "wallet_address",
+                "eoa_send_transaction",
+            ):
                 present = needed in tool_names
                 ok &= present
                 print(f"has {needed}:", present)
@@ -136,6 +153,33 @@ async def main() -> None:
             print("AES-256-GCM round-trip ok:", roundtrip)
             for p in (tmp, enc, dec):
                 p.unlink(missing_ok=True)
+
+            # Wallet-backend resolution + EOA address derivation (pure compute, offline).
+            # Hardhat account #0 — a well-known throwaway key, never funded for real use.
+            TEST_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            TEST_ADDR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            _wallet_keys = (
+                "WALLET_PRIVATE_KEY", "WALLET_BACKEND",
+                "PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID",
+            )
+            _saved = {k: os.environ.get(k) for k in _wallet_keys}
+            try:
+                for k in _wallet_keys:
+                    os.environ.pop(k, None)
+                no_backend = srv.available_backends() == []
+                os.environ["WALLET_PRIVATE_KEY"] = TEST_PK
+                eoa_backend = (
+                    srv.available_backends() == ["eoa"]
+                    and srv.resolve_backend() == "eoa"
+                    and srv._eoa_address() == TEST_ADDR
+                )
+            finally:
+                for k in _wallet_keys:
+                    os.environ.pop(k, None)
+                    if _saved[k] is not None:
+                        os.environ[k] = _saved[k]
+            ok &= no_backend and eoa_backend
+            print("wallet backend: none-when-unset:", no_backend, "| eoa derive/select:", eoa_backend)
 
             print("\nALL ASSERTIONS PASS:", ok)
             if not ok:

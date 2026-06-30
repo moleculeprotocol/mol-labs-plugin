@@ -2,10 +2,16 @@
 
 A single **stdio MCP server** that backs the [`aura-orchestrator`](../skills/aura-orchestrator/SKILL.md)
 skill (resolve/create On-Chain Lab → createLab → public *or* private/encrypted data-room upload →
-announce → grant/transfer; OCL/V3 surface, keyed on `oclId`), including all Privy wallet ops. Every
+announce → grant/transfer; OCL/V3 surface, keyed on `oclId`), including dual-backend wallet ops. Every
 `curl` / `http_request` / `node -e` step in that skill is now a typed MCP tool, so the agent calls **one
 tool per operation**
 instead of hand-assembling shell commands, base64 dances, and EIP-712 payloads.
+
+**Two wallet backends, the user's choice (all wallet env optional):** sign/spend with a **Privy agentic
+wallet** (server-side via the Privy API — `PRIVY_APP_ID` + `PRIVY_APP_SECRET` + `PRIVY_WALLET_ID`) **or** a
+**raw EOA** (signed locally with `WALLET_PRIVATE_KEY`; the key never leaves the process). Privy never exposes
+a key, so these are distinct backends — select with `WALLET_BACKEND=privy|eoa` (auto when only one is
+configured, required when both are). `config_doctor` reports the active backend and what each still needs.
 
 - **Language:** Python (FastMCP) — chosen over Bun/Node so the plugin runs under **any**
   MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter.
@@ -83,42 +89,53 @@ arguments** — only file paths, queries, addresses, and the ephemeral `dekHandl
 | `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions`, `ocl_read` (hasRole/TBA), grantRole (skill) |
 | `ONCHAIN_LAB_FACTORY_ADDRESS` | settings.json | (skill body — `mintAndCreateAccount`, `ocl_read` oclIdOfToken/accountOfToken) |
 | `LABNFT_ADDRESS` | settings.json | (skill body — `ocl_read` mintFeeWei/ownerOf, LabNFT transfer) |
-| `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `build_access_conditions`, `ocl_read` |
-| `EVM_RPC_URL` | settings.json | `ocl_read`, `ocl_tx_identity`, `privy_send_raw_transaction` |
-| `EVM_WALLET_ADDRESS` | settings.json | wallet resolution + `x-wallet-address` |
-| `PRIVY_APP_ID` | settings.local.json | all Privy tools (basic-auth user) |
-| `PRIVY_APP_SECRET` | settings.local.json | all Privy tools (basic-auth pass) |
-| `PRIVY_WALLET_ID` | settings.local.json | wallet that signs/sends |
+| `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `eoa_send_transaction`, `build_access_conditions`, `ocl_read` |
+| `EVM_RPC_URL` | settings.json | `ocl_read`, `ocl_tx_identity`, `privy_send_raw_transaction`, `eoa_send_transaction` |
+| `WALLET_BACKEND` | settings.json | wallet backend selector — `privy` \| `eoa` (optional; auto when one is configured) |
+| `EVM_WALLET_ADDRESS` | settings.json | watch-only wallet resolution + `x-wallet-address`; Phase-5 owner/hand-off target |
+| `PRIVY_APP_ID` | settings.local.json | **[privy backend, optional]** Privy tools (basic-auth user) |
+| `PRIVY_APP_SECRET` | settings.local.json | **[privy backend, optional]** Privy tools (basic-auth pass) |
+| `PRIVY_WALLET_ID` | settings.local.json | **[privy backend, optional]** Privy wallet that signs/sends |
+| `WALLET_PRIVATE_KEY` | settings.local.json | **[eoa backend, optional]** raw EOA key — local signer for `eoa_send_transaction`, x402, `issue_owner_service_token` |
 | `MOLECULE_API_KEY` | settings.local.json | `labs_graphql` (auth=`api-key`) |
 | `MOLECULE_SERVICE_TOKEN` | settings.local.json | `labs_graphql`/DEK tools (auth=`service-token`) |
 
-If a tool needs a variable that isn't set, it returns a clear error naming the missing
-variable(s) — it never guesses an endpoint or address.
+The wallet vars are **optional until you pick a backend** — configure the Privy trio **or**
+`WALLET_PRIVATE_KEY` (not both, unless you set `WALLET_BACKEND` to disambiguate). If a tool needs a variable
+that isn't set, it returns a clear error naming the missing variable(s) — it never guesses an endpoint,
+address, or which wallet to sign with.
 
 ### Verify offline
 
 `.venv/bin/python smoke.py` lists all tools and exercises the pure-compute ones — no network or
-secrets required. It confirms the legacy IPNFT tools are gone and the OCL primitives present,
-regression-checks `abi_encode` against known-good values, confirms it rejects non-`0x` bytes, builds the
-OCL access conditions (`hasRole` OR `isAuthorizedSignerForTba`, chain `sepolia-base`), and round-trips
-AES-256-GCM encrypt/decrypt.
+secrets required (it neutralizes wallet env so the run stays offline). It confirms the legacy IPNFT tools
+are gone and the OCL primitives + dual-backend wallet tools (`wallet_address`, `eoa_send_transaction`) are
+present, regression-checks `abi_encode` against known-good values, confirms it rejects non-`0x` bytes, builds
+the OCL access conditions (`hasRole` OR `isAuthorizedSignerForTba`, chain `sepolia-base`), round-trips
+AES-256-GCM encrypt/decrypt, and checks wallet-backend resolution (no backend when unset; EOA address
+derivation/selection from `WALLET_PRIVATE_KEY`).
 
 ---
 
 ## Tools
 
-### Privy (wallet management, signing, sending)
+### Wallet (dual-backend: Privy agentic wallet **or** raw EOA)
 
-| Tool | Replaces | Returns |
-|------|----------|---------|
-| `privy_get_wallet_address` | aura `get_wallet_address`; x402 "resolve wallet" curl | `{ address, walletId }` |
-| `privy_list_wallets` | aura Step 0b curl | wallet list |
-| `privy_create_policy` | aura Step 0c curl | `{ policyId }` |
-| `privy_create_wallet` | aura Step 0d curl | `{ walletId, address }` |
-| `privy_send_transaction` | LabNFT mint (`mintAndCreateAccount`), `grantRole` | `{ txHash }` |
-| `privy_send_raw_transaction` | sign-only + self-broadcast (LabNFT `safeTransferFrom`) | `{ txHash, nonce, from, gasLimit }` |
-| `ocl_read` | read-only `eth_call` view (mintFeeWei, oclIdOfToken, accountOfToken, ownerOf, hasRole, isAuthorizedSignerForTba) | `{ values, raw }` |
-| `ocl_tx_identity` | parse a `mintAndCreateAccount` receipt (`OclIdentityCreated`) | `{ tokenId, account, oclId, found }` |
+The user picks the backend (`WALLET_BACKEND=privy|eoa`, auto when one is configured). Backend-agnostic tools
+work either way; the `privy_*` tools are the Privy signer, `eoa_send_transaction` is the local-EOA signer.
+
+| Tool | Backend | Replaces | Returns |
+|------|---------|----------|---------|
+| `wallet_address` | either | backend-agnostic operating-address lookup; reports the active backend | `{ address, backend }` |
+| `privy_get_wallet_address` | privy | aura `get_wallet_address`; x402 "resolve wallet" curl | `{ address, walletId }` |
+| `privy_list_wallets` | privy | aura Step 0b curl | wallet list |
+| `privy_create_policy` | privy | aura Step 0c curl | `{ policyId }` |
+| `privy_create_wallet` | privy | aura Step 0d curl | `{ walletId, address }` |
+| `privy_send_transaction` | privy | LabNFT mint (`mintAndCreateAccount`), `grantRole` | `{ txHash }` |
+| `privy_send_raw_transaction` | privy | sign-only + self-broadcast (LabNFT `safeTransferFrom`) | `{ txHash, nonce, from, gasLimit }` |
+| `eoa_send_transaction` | eoa | local sign + broadcast for ALL EOA writes (mint, `grantRole`, `safeTransferFrom`) | `{ txHash, nonce, from, gasLimit }` |
+| `ocl_read` | n/a (read) | read-only `eth_call` view (mintFeeWei, oclIdOfToken, accountOfToken, ownerOf, hasRole, isAuthorizedSignerForTba) | `{ values, raw }` |
+| `ocl_tx_identity` | n/a (read) | parse a `mintAndCreateAccount` receipt (`OclIdentityCreated`) | `{ tokenId, account, oclId, found }` |
 
 ### Molecule HTTP
 
@@ -129,9 +146,10 @@ AES-256-GCM encrypt/decrypt.
 | `s3_upload` | cover-image + file PUT; E3 ciphertext PUT | `{ status, ok }` |
 
 `x402_pay` sends the unpaid request, decodes the `payment-required` challenge, signs the EIP-712
-`TransferWithAuthorization` with the Privy wallet (standard camelCase `primaryType`), builds and
-base64-encodes the payment payload, and retries with the `PAYMENT-SIGNATURE` header — all
-internally. The single top-level GraphQL field in `query` **must equal** `mutation`.
+`TransferWithAuthorization` **with the selected wallet backend** (Privy wallet RPC, or local `eth-account`
+for an EOA — pass `backend` when both are configured), builds and base64-encodes the payment payload, and
+retries with the `PAYMENT-SIGNATURE` header — all internally. The single top-level GraphQL field in `query`
+**must equal** `mutation`.
 
 ### DEK-aware (the plaintext DEK never leaves the server)
 
