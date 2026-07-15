@@ -3,6 +3,7 @@ name: aura-orchestrator
 description: End-to-end DeSci molecule on the OCL (On-Chain Labs) surface — resolve-or-create an on-chain lab (LabNFT + token-bound account), register it, upload files (public or private/encrypted), and announce. Single-agent sequential execution, driven entirely through the `molecule` MCP server (no raw curl).
 metadata:
   env_vars:
+    - ENVIRONMENT
     - MOLECULE_CLIENT_URL
     - MOLECULE_LABS_URL
     - ONCHAIN_LAB_FACTORY_ADDRESS
@@ -58,8 +59,9 @@ Set `WALLET_BACKEND=privy|eoa` to pin the choice (auto-selected when only one is
 
 | Variable | Description |
 |----------|-------------|
+| `ENVIRONMENT` | Deployment profile: `staging` (Base Sepolia) or `production` (Base mainnet). |
 | `MOLECULE_LABS_URL` | Labs GraphQL endpoint (OCL/V3 surface). |
-| `MOLECULE_CLIENT_URL` | Client app base URL — used only to build the project URL (`/projects/{oclId}`) for announcements. |
+| `MOLECULE_CLIENT_URL` | Client app base URL — used only to build the project URL (`/projects/{shortname}`) for announcements. |
 | `ONCHAIN_LAB_FACTORY_ADDRESS` | `OnChainLabFactory` — `mintAndCreateAccount` / `createAccount` / `oclIdOfToken` / `accountOfToken` (Base / Base Sepolia). |
 | `LABNFT_ADDRESS` | **Optional override.** `LabNFT` ERC-721 — `mintFeeWei()`, `ownerOf`, `safeTransferFrom`. Auto-discovered from the factory (`getDerivationConfigDetails().labNft`, Step 1·0); set only to pin/override it. |
 | `ACCESS_RESOLVER_ADDRESS` | **Required** — AccessResolver V3 (`hasRole` / `isAuthorizedSignerForTba` / `grantRole`). Not derivable on-chain (the resolver points to LabNFT, not vice-versa), so set it explicitly. |
@@ -78,11 +80,25 @@ Set `WALLET_BACKEND=privy|eoa` to pin the choice (auto-selected when only one is
 file paths, addresses, queries, and non-secret values as tool arguments — never secrets. Switching between
 staging and production is a `.env` edit only — never modify the skill body for environment changes.
 
+Only these two environment/chain profiles are supported. The contract values are synchronized with
+`desci-infra/lambda/common/utils/chain.ts`. `X402_GATEWAY_URL` is the deployed API Gateway **base URL**
+from the matching stack's `X402GatewayEndpoint_*` output, with `/x402/labs/{mutation}` removed (the MCP
+appends that path). The staging client URL comes from the current Labs staging deployment; production is
+`https://labs.molecule.xyz`.
+
+| `ENVIRONMENT` | Labs GraphQL | Chain | Factory | LabNFT | AccessResolver |
+|---|---|---:|---|---|---|
+| `staging` | `https://staging.graphql.api.molecule.xyz/graphql` | Base Sepolia (`84532`) | `0xd629FE2310b4309a212495F10A47f8436dcEfD90` | `0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28` | `0x5493F472602C87318EA5Eff753cDD593bf9bF559` |
+| `production` | `https://production.graphql.api.molecule.xyz/graphql` | Base (`8453`) | `0xECdF4f05384056507485C90aeAb0a83268760D6E` | `0x9F96027eeAFb9ad5F2b5d7043B36Ee96B2EeBE92` | `0x89a14Be8f7824d4775053Edad0f2fA2d6767b72B` |
+
+Run `mcp__molecule__config_doctor` before Phase 0 and stop on any `configurationIssues`; this catches
+staging/production endpoint, chain, or contract-address mismatches before any spend.
+
 ## Input
 
 - A research PDF file in the workspace (e.g. `.tengu-attachments/document.pdf`)
 - An optional cover image (PNG/JPG) in `.tengu-attachments/`
-- **Lab name, description, symbol** — draft these from the research document (surface them so the user can override). `symbol` is a short ticker (e.g. `RARE`).
+- **Lab name and description** — draft these from the research document (surface them so the user can override). The backend derives the human-readable `shortname` from the lab name; there is no user-supplied symbol.
 - **Upload visibility** — REQUIRED and **user-supplied**; it is the one knob that changes Phase 3, so you **MUST ask the user up front** rather than silently assuming. Pick ONE:
   1. **Public file upload** — stored as plaintext with `accessLevel: PUBLIC`. Run Phase 3 Steps A–C.
   2. **Private file upload** (confidential / encrypted) — AES-256-GCM envelope-encrypted client-side, stored as ciphertext with a non-PUBLIC `accessLevel` and on-chain access conditions. Run Phase 3 Private variant Steps E0–E6 **instead of** A–C. This path additionally needs `MOLECULE_SERVICE_TOKEN`.
@@ -93,7 +109,7 @@ Before Phase 0, ask the user — in a single prompt (e.g. `AskUserQuestion`) —
 
 1. **Wallet backend — Privy agentic wallet or raw EOA** — the operating wallet that signs every on-chain tx and x402 payment. **You MUST ask; never assume.** If `config_doctor` shows exactly one backend configured, present that as the pre-selected default but still confirm; if both are configured, the user MUST pick (the MCP will not guess). Record the choice and use it for the whole run (pass it as `backend` where a tool accepts it, and treat `WALLET_BACKEND` as the source of truth). `privy` → Phase 0 Privy variant (Steps 0a–0d); `eoa` → Phase 0 EOA variant (Step 0e).
 2. **Upload visibility — public or private/encrypted** — the Phase 3 path selector. Present **public** as the pre-selected default but require the user to confirm. `public` → Phase 3 Steps A–C; `private/encrypted` → Phase 3 Private variant Steps E0–E6 (also needs `MOLECULE_SERVICE_TOKEN`).
-3. **Confirm the lab name, symbol, and description** you auto-drafted from the document (the user may override). These are the only lab metadata fields (`UpdateLabNftMetadataInput`: name / description / image / externalUrl) — there is no research-lead / organization / funding metadata on an OCL lab.
+3. **Confirm the lab name and description** you auto-drafted from the document (the user may override). The backend derives `shortname` from `name`; the editable lab metadata fields are `name` / `description` / `image` / `externalUrl` — there is no symbol, research-lead, organization, or funding metadata on an OCL lab.
 
 Once gathered, run Phases 0–5 as one uninterrupted sequence.
 
@@ -163,15 +179,16 @@ mcp__molecule__ocl_read:
 shared_cache: { "operation": "put", "namespace": "molecule", "key": "lab_nft_address", "value": "<lab_nft_address>" }
 ```
 
-### Step 1a — Look for an existing lab the wallet admins
-`labs(walletAddress)` returns only labs where the wallet is registered as an admin.
+### Step 1a — Look for an existing lab the wallet owns
+`labs(walletAddress)` returns labs for every active membership role, so the owner filter is mandatory for
+this owner/admin workflow.
 ```
 mcp__molecule__labs_graphql:
   auth: api-key
-  query: "query Labs($walletAddress: String) { labs(walletAddress: $walletAddress) { totalCount nodes { oclId symbol labAccountAddress labNftTokenId } } }"
+  query: "query Labs($walletAddress: String!) { labs(walletAddress: $walletAddress, role: OWNER) { totalCount nodes { oclId shortname labAccountAddress labNftTokenId } } }"
   variables: { "walletAddress": "<wallet_address>" }
 ```
-- If `data.labs.totalCount > 0`: **REUSE**. Pick the intended lab (if more than one, ask the user which `symbol`/`oclId`). Save its `oclId`, `labAccountAddress`, `labNftTokenId`. (Optionally double-check modify rights: `mcp__molecule__ocl_read` `ownerOf(uint256)` on `<lab_nft_address>` == `wallet_address`, or `hasRole(bytes32,address,uint8)` returns true for role `2`.) Skip to **Phase 2** (createLab is idempotent for an already-registered lab — re-running returns the existing lab; if it errors `already exists`, treat as success). 
+- If `data.labs.totalCount > 0`: **REUSE**. Pick the intended lab (if more than one, ask the user which `shortname`/`oclId`). Save its `oclId`, `shortname`, `labAccountAddress`, `labNftTokenId`. Skip to **Phase 2** (createLab is idempotent for an already-registered lab — re-running returns the existing lab; if it errors `already exists`, treat as success).
 - If `totalCount == 0`: **MINT** a new lab (Step 1b).
 
 ### Step 1b — Mint a new LabNFT + token-bound account
@@ -317,13 +334,16 @@ owner, so it passes the createLab admin check.
 ```
 mcp__molecule__x402_pay:
   mutation: createLab
-  query: "mutation CreateLab($input: CreateLabInput!) { createLab(input: $input) { isSuccess message error { message code retryable } lab { oclId symbol labAccountAddress labNftTokenId } } }"
-  variables: { "input": { "oclId": "<oclId>", "symbol": "<symbol>" } }
+  query: "mutation CreateLab($input: CreateLabInput!) { createLab(input: $input) { isSuccess message error { message code retryable } lab { oclId shortname labAccountAddress labNftTokenId } } }"
+  variables: { "input": { "oclId": "<oclId>" } }
 ```
 If `isSuccess` is false because the admin role isn't indexed yet (just-minted lab), poll `labs(walletAddress)`
-(Step 1a) until the new `oclId` appears, then retry — do NOT use a fixed long sleep. Build the project URL
-`$MOLECULE_CLIENT_URL/projects/{oclId}` and cache it:
+(Step 1a, including `role: OWNER`) until the new `oclId` appears, then retry — do NOT use a fixed long
+sleep. Use the `shortname` saved in Step 1a or returned as `lab.shortname`; if it is null, poll the same
+owner-only query until the lab's derived `shortname` is present. Cache it, then build the project URL
+`$MOLECULE_CLIENT_URL/projects/{shortname}` and cache that:
 ```
+shared_cache: { "operation": "put", "namespace": "molecule", "key": "shortname", "value": "<shortname>" }
 shared_cache: { "operation": "put", "namespace": "molecule", "key": "project_url", "value": "<project_url>" }
 ```
 
@@ -505,11 +525,11 @@ mcp__molecule__x402_pay:
 
 ### External Posting Copy Rules (Phase 4 body + any Beach.science post)
 The active chain id for this run is **$CHAIN_ID** (resolved from env).
-- **Project URL:** use `$MOLECULE_CLIENT_URL/projects/{oclId}` verbatim — never substitute another domain or the legacy `/ipnfts/` route.
+- **Project URL:** use `$MOLECULE_CLIENT_URL/projects/{shortname}` verbatim — never substitute the `oclId`, another domain, or the legacy `/ipnfts/` route.
 - **Chain name:** chain id `8453` → "Base mainnet (8453)"; `84532` → "Base Sepolia (84532)". Name any other chain id explicitly. Do NOT mislabel the active chain.
 - **TX explorer links:** chain id `8453` → `https://basescan.org/tx/<hash>`; `84532` → `https://sepolia.basescan.org/tx/<hash>`.
 - **Update slugs:** any `/updates/<slug>` link MUST be lowercase, hyphen-separated, NO file extension (e.g. `/updates/kiss1r-pipeline-update-gen2`).
-- Do not invent URLs, symbols, or transaction hashes — use the values saved to `shared_cache` during this run.
+- Do not invent URLs, shortnames, or transaction hashes — use the values saved to `shared_cache` during this run.
 
 ## Phase 5: Co-ownership / hand-off
 
@@ -533,7 +553,7 @@ mcp__molecule__privy_send_transaction:   # OR mcp__molecule__eoa_send_transactio
 ```
 Save `txHash` as `grant_tx_hash`.
 
-**Verify + indexing caveat (important).** The grant is effective **on-chain** immediately — confirm with `mcp__molecule__ocl_read: { functionSignature: "hasRole(bytes32,address,uint8)", to: $ACCESS_RESOLVER_ADDRESS, args: ["<oclId>", "<owner_wallet>", 2], returns: ["bool"] }` → `true`. But decryption ALSO needs the DB `authorizeViewer` gate, which reads an **indexed** `ocl_user` table populated by the AccessResolver `RoleGranted` replay (`ocl-processor`), NOT the chain directly. That indexer can **lag badly**: on the `migration`/pre-prod stack a fresh grant was observed to NOT materialize for 18+ minutes (the replay seeds from `l2StartBlock`, distinct from the fast `onchain_event` owner indexer). So the grantee can get `AUTH_FAILED` ("not authorized as viewer") from `decryptDataKey` for a long time even though `hasRole` is already `true`. To check readiness, test `labs_decrypt_dek` as the grantee (a service token bound to that wallet). If it keeps returning `AUTH_FAILED` long after the grant, the AccessResolver indexer is behind for this environment — use **Option B (transfer)** for prompt decrypt access, or flag the backend; do NOT re-grant (the on-chain state is already correct).
+**Verify + indexing caveat (important).** The grant is effective **on-chain** immediately — confirm with `mcp__molecule__ocl_read: { functionSignature: "hasRole(bytes32,address,uint8)", to: $ACCESS_RESOLVER_ADDRESS, args: ["<oclId>", "<owner_wallet>", 2], returns: ["bool"] }` → `true`. But decryption ALSO needs the DB `authorizeViewer` gate, which reads an **indexed** `ocl_user` table populated by the AccessResolver `RoleGranted` replay (`ocl-processor`), NOT the chain directly. That indexer can lag behind the chain, especially on staging. So the grantee can temporarily get `AUTH_FAILED` ("not authorized as viewer") from `decryptDataKey` even though `hasRole` is already `true`. To check readiness, test `labs_decrypt_dek` as the grantee (a service token bound to that wallet). If it keeps returning `AUTH_FAILED` long after the grant, the AccessResolver indexer is behind for this environment — use **Option B (transfer)** for prompt decrypt access, or flag the backend; do NOT re-grant (the on-chain state is already correct).
 
 ### Option B — Transfer the LabNFT (true hand-off; the agent LOSES control)
 Only when the owner should fully take over. After transfer the new holder is the TBA owner and the agent can no longer admin or decrypt. **Never transfer to the lab's own TBA (`labAccountAddress`) — the contract reverts.**
@@ -557,7 +577,7 @@ mcp__molecule__eoa_send_transaction:
   data: <calldata>
   chainId: $CHAIN_ID
 ```
-Save `txHash` as `transfer_tx_hash`. **Verify** with `mcp__molecule__ocl_read: { functionSignature: "ownerOf(uint256)", to: <lab_nft_address>, args: ["<labNftTokenId>"], returns: ["address"] }` → `owner_wallet`. Unlike a role grant (Option A), the new owner's membership indexes via the **fast `onchain_event` path** (the LabNFT `Transfer` event → ~minutes), so decrypt works promptly. This is the reliable way to give a wallet decrypt access when the AccessResolver-event indexer is lagging (e.g. on `migration`) — at the cost of handing over control.
+Save `txHash` as `transfer_tx_hash`. **Verify** with `mcp__molecule__ocl_read: { functionSignature: "ownerOf(uint256)", to: <lab_nft_address>, args: ["<labNftTokenId>"], returns: ["address"] }` → `owner_wallet`. Unlike a role grant (Option A), the new owner's membership indexes via the **fast `onchain_event` path** (the LabNFT `Transfer` event → ~minutes), so decrypt works promptly. This is the reliable way to give a wallet decrypt access when the AccessResolver-event indexer is lagging — at the cost of handing over control.
 
 ### Owner decrypt access (private / encrypted uploads only)
 Skip for public uploads. After Option A (grantRole) or Option B (transfer), the owner satisfies the lab's
@@ -571,7 +591,7 @@ Final results to report:
 - `labAccountAddress` (the token-bound account)
 - `labNftTokenId`
 - `mint_tx_hash` (if a new lab was minted; omit if an existing lab was reused)
-- `project_url`: `$MOLECULE_CLIENT_URL/projects/{oclId}`
+- `project_url`: `$MOLECULE_CLIENT_URL/projects/{shortname}`
 - `datasetId` from upload
 - Announcement success status
 - `grant_tx_hash` or `transfer_tx_hash` (if Phase 5 ran)

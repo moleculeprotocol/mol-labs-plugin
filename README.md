@@ -5,7 +5,7 @@ installable plugin that works under **Claude Code** and **OpenAI Codex** (and an
 server alone).
 
 - **`aura-orchestrator`** — the whole molecule in one skill: resolve-or-create an **On-Chain Lab** (mint a
-  LabNFT + token-bound account, or reuse one the wallet admins) → register it (`createLab`) → data-room
+  LabNFT + token-bound account, or reuse one the wallet owns) → register it (`createLab`) → data-room
   file upload → announcement → role-grant/hand-off. OCL/V3 surface, keyed on `oclId`. The file upload
   (Phase 3) is the only branch: choose **public** (plaintext) or **private** (client-side AES-256-GCM
   envelope-encrypted, access-controlled) — **x402 pays per call either way**.
@@ -51,7 +51,7 @@ The MCP server runs via **`uv run mcp/server.py`**, which reads the PEP 723 inli
 ## Environment variables
 
 The server reads all config/secrets from the environment (never from tool args). Provide them however
-your harness injects env into MCP subprocesses. Non-secrets: `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
+your harness injects env into MCP subprocesses. Non-secrets: `ENVIRONMENT`, `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
 `X402_GATEWAY_URL`, `ACCESS_RESOLVER_ADDRESS`, `ONCHAIN_LAB_FACTORY_ADDRESS`, `LABNFT_ADDRESS`, `CHAIN_ID`,
 `EVM_WALLET_ADDRESS`, `EVM_RPC_URL`, `WALLET_BACKEND`. Secrets: `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`.
 
@@ -94,13 +94,15 @@ command = "uv"
 args = ["run", "/molecule-plugin/mcp/server.py"]
 
 [mcp_servers.molecule.env]
-MOLECULE_LABS_URL = "https://…/graphql"
-X402_GATEWAY_URL  = "https://…"
+ENVIRONMENT       = "staging"
+MOLECULE_CLIENT_URL = "https://…" # current Labs staging deployment base URL
+MOLECULE_LABS_URL = "https://staging.graphql.api.molecule.xyz/graphql"
+X402_GATEWAY_URL  = "https://…" # staging API Gateway base; no /x402/labs suffix
 CHAIN_ID          = "84532"
 EVM_WALLET_ADDRESS = "0x…"
-ACCESS_RESOLVER_ADDRESS = "0x…"
-ONCHAIN_LAB_FACTORY_ADDRESS = "0x…"
-LABNFT_ADDRESS = "0x…"
+ACCESS_RESOLVER_ADDRESS = "0x5493F472602C87318EA5Eff753cDD593bf9bF559"
+ONCHAIN_LAB_FACTORY_ADDRESS = "0xd629FE2310b4309a212495F10A47f8436dcEfD90"
+LABNFT_ADDRESS = "0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28"
 WALLET_BACKEND = "privy"          # or "eoa"
 # secrets — configure ONE wallet backend:
 #   Privy agentic wallet:
@@ -113,6 +115,17 @@ MOLECULE_API_KEY = "…"
 MOLECULE_SERVICE_TOKEN = "…"
 ```
 or, equivalently: `codex mcp add molecule --env CHAIN_ID=84532 --env … -- uv run /abs/path/to/molecule-plugin/mcp/server.py`
+
+| Environment | Labs GraphQL | Chain | Factory | LabNFT | AccessResolver |
+|---|---|---:|---|---|---|
+| `staging` | `https://staging.graphql.api.molecule.xyz/graphql` | Base Sepolia (`84532`) | `0xd629FE2310b4309a212495F10A47f8436dcEfD90` | `0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28` | `0x5493F472602C87318EA5Eff753cDD593bf9bF559` |
+| `production` | `https://production.graphql.api.molecule.xyz/graphql` | Base (`8453`) | `0xECdF4f05384056507485C90aeAb0a83268760D6E` | `0x9F96027eeAFb9ad5F2b5d7043B36Ee96B2EeBE92` | `0x89a14Be8f7824d4775053Edad0f2fA2d6767b72B` |
+
+For `X402_GATEWAY_URL`, use the matching stack's `X402GatewayEndpoint_staging` or
+`X402GatewayEndpoint_production` output, removing `/x402/labs/{mutation}` so the value is the API Gateway
+base URL. `MOLECULE_CLIENT_URL` is likewise the environment's Labs app base URL (production:
+`https://labs.molecule.xyz`). The workflow appends `/projects/{shortname}`. Run `config_doctor` after every
+environment switch; it reports cross-profile endpoints, chains, and addresses under `configurationIssues`.
 
 **Skills:** if your Codex version supports a plugin marketplace, it can also read
 `.claude-plugin/marketplace.json` (interop). Otherwise copy `skills/aura-orchestrator/SKILL.md` into the
@@ -137,7 +150,8 @@ phase order; below is the one-time setup that precedes it.
 ### Step 0 — One-time setup (do once, before running the skill)
 
 1. **Env + MCP.** Install `uv`, register the plugin (Claude) or MCP server (Codex), and set the env vars
-   above. Pick the surface with `MOLECULE_LABS_URL` / `X402_GATEWAY_URL` / `CHAIN_ID` / `ENVIRONMENT`.
+   above. Choose `ENVIRONMENT=staging` for Base Sepolia or `ENVIRONMENT=production` for Base mainnet, then
+   use only the matching endpoints, chain id, and contracts from the table above.
 2. **Wallet — pick a backend (you're in control).** Either:
    - **Privy agentic wallet:** if `PRIVY_WALLET_ID` is unset, **aura-orchestrator Phase 0** creates a Privy
      server wallet **with a policy** (single-chain + per-tx value cap) via the MCP `privy_*` tools; set the
@@ -172,8 +186,8 @@ createLab → upload → announce → grant/transfer). The only choice is the **
 
 ```
 Phase 0  Wallet setup                 (Privy agentic wallet OR raw EOA — user's choice)
-Phase 1  Resolve-or-create OCL lab    → oclId, labAccountAddress, labNftTokenId   (reuse via labs(walletAddress), else mint LabNFT)
-Phase 2  createLab (x402)             → registers the lab for oclId   (poll labs(walletAddress) for indexer)
+Phase 1  Resolve-or-create OCL lab    → oclId, shortname, labAccountAddress, labNftTokenId   (owner-only reuse, else mint LabNFT)
+Phase 2  createLab (x402)             → registers the lab for oclId   (poll owner-only labs query for indexer)
 Phase 3  Upload file to data room     PUBLIC (Steps A–C)  OR  encrypted (E0–E6)
 Phase 4  createAnnouncement (x402)    (attach the datasetId from Phase 3)
 Phase 5  grantRole / LabNFT hand-off  (optional co-owner)

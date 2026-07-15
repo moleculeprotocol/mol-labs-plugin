@@ -44,6 +44,8 @@ async def main() -> None:
             "WALLET_PRIVATE_KEY": "",
             "WALLET_BACKEND": "",
             "MOLECULE_SERVICE_TOKEN": "",
+            "ENVIRONMENT": "staging",
+            "MOLECULE_LABS_URL": "https://staging.graphql.api.molecule.xyz/graphql",
             "EVM_WALLET_ADDRESS": "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c",
             "ACCESS_RESOLVER_ADDRESS": "0x5493F472602C87318EA5Eff753cDD593bf9bF559",
             "ONCHAIN_LAB_FACTORY_ADDRESS": "0xd629FE2310b4309a212495F10A47f8436dcEfD90",
@@ -82,6 +84,16 @@ async def main() -> None:
                 present = needed in tool_names
                 ok &= present
                 print(f"has {needed}:", present)
+
+            # The staging fixture must match the supported backend profile and
+            # must not produce cross-environment configuration warnings.
+            doctor = await call("config_doctor", {})
+            doctor_ok = (
+                doctor["expectedEnvironmentProfile"]["CHAIN_ID"] == "84532"
+                and doctor["configurationIssues"] == []
+            )
+            ok &= doctor_ok
+            print("config_doctor staging profile consistent:", doctor_ok)
 
             # abi_encode: known-good safeTransferFrom (regression).
             r = await call("abi_encode", {
@@ -180,6 +192,43 @@ async def main() -> None:
                         os.environ[k] = _saved[k]
             ok &= no_backend and eoa_backend
             print("wallet backend: none-when-unset:", no_backend, "| eoa derive/select:", eoa_backend)
+
+            # ABI/RPC address decoders return lowercase strings. eth-account requires
+            # a checksummed string recipient when it builds/signs the transaction.
+            lower_lab_nft = "0x13ff210695fdb54a7f928eccc28bc3486c05bb28"
+            checksummed = srv._checksum_tx_recipient(lower_lab_nft)
+            from eth_account import Account
+            signed = Account.from_key(TEST_PK).sign_transaction({
+                "to": checksummed,
+                "value": 0,
+                "gas": 21_000,
+                "maxFeePerGas": 5_000_000_000,
+                "maxPriorityFeePerGas": 2_000_000_000,
+                "nonce": 0,
+                "chainId": 84_532,
+                "type": 2,
+            })
+            checksum_ok = (
+                checksummed == "0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28"
+                and bool(signed.raw_transaction)
+            )
+            ok &= checksum_ok
+            print("EOA recipient checksum normalization:", checksum_ok)
+
+            # Keep both supported deployment profiles pinned to the backend's
+            # chain.ts values; no third/pre-production profile is supported.
+            profiles = srv._OCL_CONFIG_BY_ENVIRONMENT
+            profile_ok = (
+                set(profiles) == {"staging", "production"}
+                and profiles["staging"]["CHAIN_ID"] == "84532"
+                and profiles["staging"]["ONCHAIN_LAB_FACTORY_ADDRESS"]
+                == "0xd629FE2310b4309a212495F10A47f8436dcEfD90"
+                and profiles["production"]["CHAIN_ID"] == "8453"
+                and profiles["production"]["ONCHAIN_LAB_FACTORY_ADDRESS"]
+                == "0xECdF4f05384056507485C90aeAb0a83268760D6E"
+            )
+            ok &= profile_ok
+            print("staging/production OCL profiles current:", profile_ok)
 
             print("\nALL ASSERTIONS PASS:", ok)
             if not ok:

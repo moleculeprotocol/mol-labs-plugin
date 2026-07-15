@@ -83,7 +83,8 @@ arguments** — only file paths, queries, addresses, and the ephemeral `dekHandl
 
 | Variable | Where | Used by |
 |----------|-------|---------|
-| `MOLECULE_CLIENT_URL` | settings.json | (skill body — project URL `/projects/{oclId}`) |
+| `ENVIRONMENT` | settings.json | supported profile: `staging` (Base Sepolia) or `production` (Base mainnet) |
+| `MOLECULE_CLIENT_URL` | settings.json | (skill body — project URL `/projects/{shortname}`) |
 | `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `issue_service_token` |
 | `X402_GATEWAY_URL` | settings.json | `x402_pay` |
 | `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions`, `ocl_read` (hasRole/TBA), grantRole (skill) |
@@ -104,6 +105,19 @@ The wallet vars are **optional until you pick a backend** — configure the Priv
 `WALLET_PRIVATE_KEY` (not both, unless you set `WALLET_BACKEND` to disambiguate). If a tool needs a variable
 that isn't set, it returns a clear error naming the missing variable(s) — it never guesses an endpoint,
 address, or which wallet to sign with.
+
+The supported environment profiles are:
+
+| Environment | Labs GraphQL | Chain | Factory | LabNFT | AccessResolver |
+|---|---|---:|---|---|---|
+| `staging` | `https://staging.graphql.api.molecule.xyz/graphql` | Base Sepolia (`84532`) | `0xd629FE2310b4309a212495F10A47f8436dcEfD90` | `0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28` | `0x5493F472602C87318EA5Eff753cDD593bf9bF559` |
+| `production` | `https://production.graphql.api.molecule.xyz/graphql` | Base (`8453`) | `0xECdF4f05384056507485C90aeAb0a83268760D6E` | `0x9F96027eeAFb9ad5F2b5d7043B36Ee96B2EeBE92` | `0x89a14Be8f7824d4775053Edad0f2fA2d6767b72B` |
+
+The contract matrix is synchronized with `desci-infra/lambda/common/utils/chain.ts`.
+`X402_GATEWAY_URL` must be the matching API Gateway base URL (strip
+`/x402/labs/{mutation}` from the stack output), and `MOLECULE_CLIENT_URL` must be the Labs app base URL.
+`config_doctor` reports mismatches as `configurationIssues` and will not report core readiness while any
+remain.
 
 ### Verify offline
 

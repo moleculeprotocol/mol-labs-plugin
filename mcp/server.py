@@ -51,7 +51,7 @@ import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from eth_abi import decode as abi_decode_values
 from eth_abi import encode as abi_encode_values
-from eth_utils import function_signature_to_4byte_selector, keccak
+from eth_utils import function_signature_to_4byte_selector, keccak, to_checksum_address
 
 from mcp.server.fastmcp import FastMCP
 
@@ -1174,6 +1174,32 @@ _DEFAULT_RPC_BY_CHAIN: dict[str, str] = {
     "11155111": "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia L1 (legacy)
 }
 
+# Supported OCL deployments. Keep these synchronized with desci-infra's
+# lambda/common/utils/chain.ts; config_doctor uses them to catch cross-environment
+# combinations before a paid mutation or on-chain transaction is attempted.
+_OCL_CONFIG_BY_ENVIRONMENT: dict[str, dict[str, str]] = {
+    "staging": {
+        "CHAIN_ID": "84532",
+        "MOLECULE_LABS_URL": "https://staging.graphql.api.molecule.xyz/graphql",
+        "ONCHAIN_LAB_FACTORY_ADDRESS": "0xd629FE2310b4309a212495F10A47f8436dcEfD90",
+        "LABNFT_ADDRESS": "0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28",
+        "ACCESS_RESOLVER_ADDRESS": "0x5493F472602C87318EA5Eff753cDD593bf9bF559",
+    },
+    "production": {
+        "CHAIN_ID": "8453",
+        "MOLECULE_LABS_URL": "https://production.graphql.api.molecule.xyz/graphql",
+        "MOLECULE_CLIENT_URL": "https://labs.molecule.xyz",
+        "ONCHAIN_LAB_FACTORY_ADDRESS": "0xECdF4f05384056507485C90aeAb0a83268760D6E",
+        "LABNFT_ADDRESS": "0x9F96027eeAFb9ad5F2b5d7043B36Ee96B2EeBE92",
+        "ACCESS_RESOLVER_ADDRESS": "0x89a14Be8f7824d4775053Edad0f2fA2d6767b72B",
+    },
+}
+
+
+def _checksum_tx_recipient(address: str) -> str:
+    """Normalize an RPC/ABI-derived address for eth-account transaction signing."""
+    return to_checksum_address(address)
+
 
 def _chain_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
     """Minimal JSON-RPC call against an EVM node (live nonce + raw broadcast)."""
@@ -1338,7 +1364,9 @@ def eoa_send_transaction(
     nonce, val, gas_limit_hex = _compute_tx_params(sender, to, data, value, rpc, gasLimit)
     # eth-account wants a standard (camelCase) tx dict with int values.
     transaction: dict[str, Any] = {
-        "to": to,
+        # eth_abi decodes address return values as lowercase strings, while
+        # eth-account rejects non-checksummed string recipients at sign time.
+        "to": _checksum_tx_recipient(to),
         "value": int(val, 16),
         "gas": int(gas_limit_hex, 16),
         "maxFeePerGas": _int_of(maxFeePerGas or "0x12a05f200"),  # 5 gwei
@@ -1823,6 +1851,7 @@ def issue_owner_service_token(
 # OPTIONAL: you configure exactly ONE backend (Privy agentic wallet OR raw EOA), or both
 # and select with WALLET_BACKEND. Nothing here is required until you pick a wallet.
 _ENV_CATALOG: list[tuple[str, bool, str]] = [
+    ("ENVIRONMENT", False, "Supported deployment profile: staging | production"),
     ("MOLECULE_LABS_URL", False, "Labs GraphQL endpoint (OCL/V3 surface)"),
     ("MOLECULE_CLIENT_URL", False, "Client base URL for project links"),
     ("ONCHAIN_LAB_FACTORY_ADDRESS", False, "OnChainLabFactory (mint + TBA, oclId reads)"),
@@ -1844,9 +1873,9 @@ _ENV_CATALOG: list[tuple[str, bool, str]] = [
 # Per-flow required NON-wallet vars, for a quick readiness verdict. Wallet readiness is
 # reported separately (walletBackends) because either backend satisfies the spending flows.
 _FLOW_REQUIREMENTS: list[tuple[str, list[str]]] = [
-    ("labs_reads", ["MOLECULE_LABS_URL", "MOLECULE_API_KEY"]),
-    ("onchain_lab", ["ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
-    ("x402_mutations", ["X402_GATEWAY_URL", "CHAIN_ID"]),  # + any one wallet backend
+    ("labs_reads", ["ENVIRONMENT", "MOLECULE_LABS_URL", "MOLECULE_API_KEY"]),
+    ("onchain_lab", ["ENVIRONMENT", "ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
+    ("x402_mutations", ["ENVIRONMENT", "X402_GATEWAY_URL", "CHAIN_ID"]),  # + any one wallet backend
     ("private_encrypted_upload", ["MOLECULE_SERVICE_TOKEN", "MOLECULE_API_KEY"]),
 ]
 
@@ -1884,6 +1913,33 @@ def config_doctor(showValues: bool = True) -> str:
                 entry["value"] = val
         vars_report.append(entry)
 
+    environment = (env("ENVIRONMENT") or "").lower()
+    expected_profile = _OCL_CONFIG_BY_ENVIRONMENT.get(environment)
+    configuration_issues: list[str] = []
+    if environment and expected_profile is None:
+        configuration_issues.append(
+            f"Unsupported ENVIRONMENT {environment!r}; use 'staging' or 'production'."
+        )
+    if expected_profile:
+        for name, expected in expected_profile.items():
+            actual = env(name)
+            if actual and actual.rstrip("/").lower() != expected.rstrip("/").lower():
+                configuration_issues.append(
+                    f"{name} does not match the {environment} profile (expected {expected})."
+                )
+    gateway = env("X402_GATEWAY_URL")
+    if gateway and "/x402/labs" in gateway.rstrip("/"):
+        configuration_issues.append(
+            "X402_GATEWAY_URL must be the API Gateway base URL only; the MCP appends "
+            "/x402/labs/{mutation}."
+        )
+    client_url = env("MOLECULE_CLIENT_URL")
+    if client_url and "/projects" in client_url.rstrip("/"):
+        configuration_issues.append(
+            "MOLECULE_CLIENT_URL must be the Labs app base URL only; the workflow appends "
+            "/projects/{shortname}."
+        )
+
     flows: list[dict[str, Any]] = []
     for flow, required in _FLOW_REQUIREMENTS:
         missing = [r for r in required if not os.environ.get(r)]
@@ -1918,7 +1974,12 @@ def config_doctor(showValues: bool = True) -> str:
     )
     # Core is ready when the non-wallet spending flows are set AND at least one wallet
     # backend is usable AND (if both are configured) a choice has been made.
-    core_ready = bool(avail) and flows_ready and not wallet_backends["needsChoice"]
+    core_ready = (
+        bool(avail)
+        and flows_ready
+        and not wallet_backends["needsChoice"]
+        and not configuration_issues
+    )
     try:
         global_excluded = str((Path.home() / ".claude").resolve())
     except Exception:
@@ -1932,6 +1993,8 @@ def config_doctor(showValues: bool = True) -> str:
             "envVars": vars_report,
             "walletBackends": wallet_backends,
             "flows": flows,
+            "expectedEnvironmentProfile": expected_profile,
+            "configurationIssues": configuration_issues,
             "note": (
                 "Wallet creds are OPTIONAL and you are in control of which wallet signs: "
                 "configure the Privy agentic wallet (PRIVY_APP_ID + PRIVY_APP_SECRET + "
