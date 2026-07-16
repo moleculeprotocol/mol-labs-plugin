@@ -4,3 +4,4 @@ cryptography>=42
 eth-abi>=5
 eth-utils>=4
 eth-hash[pycryptodome]>=0.5
+eth-account>=0.13

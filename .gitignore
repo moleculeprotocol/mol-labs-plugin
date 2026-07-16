@@ -4,3 +4,4 @@ __pycache__/
 *.log
 .DS_Store
 uv.lock
+skills/privy-agentic-wallets-skill/

@@ -2,15 +2,15 @@
   "name": "molecule-desci-marketplace",
   "description": "Local marketplace for the molecule-desci plugin: DeSci orchestration skills + the molecule MCP server.",
   "owner": {
-    "name": "Vladimir Demidov",
+    "name": "molecule-desci",
     "email": "vladimir@molecule.to"
   },
   "plugins": [
     {
       "name": "molecule-desci",
       "source": "./",
-      "description": "DeSci molecule orchestration (aura-orchestrator skill: public or private/encrypted data-room uploads) backed by the molecule MCP server. V2 GraphQL surface, keyed on ipnftUid.",
-      "version": "0.2.0"
+      "description": "DeSci molecule orchestration (aura-orchestrator skill: On-Chain Lab creation + public or private/encrypted data-room uploads) backed by the molecule MCP server. OCL/V3 GraphQL surface, keyed on oclId.",
+      "version": "0.4.0"
     }
   ]
 }

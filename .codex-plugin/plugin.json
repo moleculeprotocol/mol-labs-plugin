@@ -1,7 +1,7 @@
 {
   "name": "molecule-desci",
-  "version": "0.2.0",
-  "description": "DeSci molecule orchestration for Molecule Labs in one skill (aura-orchestrator): POI registration + IP-NFT minting + project creation + x402-paid data-room file upload (public or client-side-encrypted) + announcement + transfer, backed by the `molecule` MCP server. V2 GraphQL surface, keyed on ipnftUid.",
+  "version": "0.4.0",
+  "description": "DeSci molecule orchestration for Molecule Labs in one skill (aura-orchestrator): resolve-or-create an On-Chain Lab (LabNFT + token-bound account) + register it (createLab) + x402-paid data-room file upload (public or client-side-encrypted) + announcement + role-grant/hand-off, backed by the `molecule` MCP server. OCL/V3 GraphQL surface, keyed on oclId.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
 }

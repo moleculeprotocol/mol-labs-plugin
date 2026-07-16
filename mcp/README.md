@@ -1,11 +1,17 @@
 # molecule-mcp
 
-A single **stdio MCP server** that backs the [`aura-orchestrator`](../aura-orchestrator/SKILL.md)
-skill (POI → mint → project → public *or* private/encrypted data-room upload → announce → transfer)
-and the [`privy-agentic-wallets`](../privy-agentic-wallets/SKILL.md) helper. Every `curl` /
-`http_request` / `node -e` step in those skills is now a typed MCP tool, so the agent calls **one
+A single **stdio MCP server** that backs the [`aura-orchestrator`](../skills/aura-orchestrator/SKILL.md)
+skill (resolve/create On-Chain Lab → createLab → public *or* private/encrypted data-room upload →
+announce → grant/transfer; OCL/V3 surface, keyed on `oclId`), including dual-backend wallet ops. Every
+`curl` / `http_request` / `node -e` step in that skill is now a typed MCP tool, so the agent calls **one
 tool per operation**
 instead of hand-assembling shell commands, base64 dances, and EIP-712 payloads.
+
+**Two wallet backends, the user's choice (all wallet env optional):** sign/spend with a **Privy agentic
+wallet** (server-side via the Privy API — `PRIVY_APP_ID` + `PRIVY_APP_SECRET` + `PRIVY_WALLET_ID`) **or** a
+**raw EOA** (signed locally with `WALLET_PRIVATE_KEY`; the key never leaves the process). Privy never exposes
+a key, so these are distinct backends — select with `WALLET_BACKEND=privy|eoa` (auto when only one is
+configured, required when both are). `config_doctor` reports the active backend and what each still needs.
 
 - **Language:** Python (FastMCP) — chosen over Bun/Node so the plugin runs under **any**
   MCP-capable harness (Claude Code, Codex, …) with only a Python interpreter.
@@ -72,66 +78,92 @@ After registering, enable it in your harness (for Claude Code: add `"molecule"` 
 
 The server reads all configuration from **environment variables**, which the harness injects into
 the MCP subprocess (for Claude Code, from `.claude/settings.json` non-secrets and
-`.claude/settings.local.json` secrets). The skills therefore **never pass secrets as tool
+`.claude/settings.local.json` secrets). The skill therefore **never passes secrets as tool
 arguments** — only file paths, queries, addresses, and the ephemeral `dekHandle`.
 
 | Variable | Where | Used by |
 |----------|-------|---------|
-| `MOLECULE_CLIENT_URL` | settings.json | `poi_register` |
+| `ENVIRONMENT` | settings.json | supported profile: `staging` (Base Sepolia) or `production` (Base mainnet) |
+| `MOLECULE_CLIENT_URL` | settings.json | (skill body — project URL `/projects/{shortname}`) |
 | `MOLECULE_LABS_URL` | settings.json | `labs_graphql`, `labs_generate_dek`, `labs_decrypt_dek`, `issue_service_token` |
 | `X402_GATEWAY_URL` | settings.json | `x402_pay` |
-| `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions` |
-| `IPNFT_CONTRACT_ADDRESS` | settings.json | (skill body) |
-| `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `build_access_conditions` |
-| `ENVIRONMENT` | settings.json | `build_access_conditions` (base vs baseSepolia) |
-| `EVM_WALLET_ADDRESS` | settings.json | wallet resolution + `x-wallet-address` |
-| `EXPERIMENT_COST_CENTS` | settings.json | (skill body) |
-| `PRIVY_APP_ID` | settings.local.json | all Privy tools (basic-auth user) |
-| `PRIVY_APP_SECRET` | settings.local.json | all Privy tools (basic-auth pass) |
-| `PRIVY_WALLET_ID` | settings.local.json | wallet that signs/sends |
-| `POI_API_KEY` | settings.local.json | `poi_register` |
+| `ACCESS_RESOLVER_ADDRESS` | settings.json | `build_access_conditions`, `ocl_read` (hasRole/TBA), grantRole (skill) |
+| `ONCHAIN_LAB_FACTORY_ADDRESS` | settings.json | (skill body — `mintAndCreateAccount`, `ocl_read` oclIdOfToken/accountOfToken) |
+| `LABNFT_ADDRESS` | settings.json | (skill body — `ocl_read` mintFeeWei/ownerOf, LabNFT transfer) |
+| `CHAIN_ID` | settings.json | `privy_create_policy`, `privy_send_transaction`, `eoa_send_transaction`, `build_access_conditions`, `ocl_read` |
+| `EVM_RPC_URL` | settings.json | `ocl_read`, `ocl_tx_identity`, `privy_send_raw_transaction`, `eoa_send_transaction` |
+| `WALLET_BACKEND` | settings.json | wallet backend selector — `privy` \| `eoa` (optional; auto when one is configured) |
+| `EVM_WALLET_ADDRESS` | settings.json | watch-only wallet resolution + `x-wallet-address`; Phase-5 owner/hand-off target |
+| `PRIVY_APP_ID` | settings.local.json | **[privy backend, optional]** Privy tools (basic-auth user) |
+| `PRIVY_APP_SECRET` | settings.local.json | **[privy backend, optional]** Privy tools (basic-auth pass) |
+| `PRIVY_WALLET_ID` | settings.local.json | **[privy backend, optional]** Privy wallet that signs/sends |
+| `WALLET_PRIVATE_KEY` | settings.local.json | **[eoa backend, optional]** raw EOA key — local signer for `eoa_send_transaction`, x402, `issue_owner_service_token` |
 | `MOLECULE_API_KEY` | settings.local.json | `labs_graphql` (auth=`api-key`) |
 | `MOLECULE_SERVICE_TOKEN` | settings.local.json | `labs_graphql`/DEK tools (auth=`service-token`) |
 
-If a tool needs a variable that isn't set, it returns a clear error naming the missing
-variable(s) — it never guesses an endpoint or address.
+The wallet vars are **optional until you pick a backend** — configure the Privy trio **or**
+`WALLET_PRIVATE_KEY` (not both, unless you set `WALLET_BACKEND` to disambiguate). If a tool needs a variable
+that isn't set, it returns a clear error naming the missing variable(s) — it never guesses an endpoint,
+address, or which wallet to sign with.
+
+The supported environment profiles are:
+
+| Environment | Labs GraphQL | Chain | Factory | LabNFT | AccessResolver |
+|---|---|---:|---|---|---|
+| `staging` | `https://staging.graphql.api.molecule.xyz/graphql` | Base Sepolia (`84532`) | `0xd629FE2310b4309a212495F10A47f8436dcEfD90` | `0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28` | `0x5493F472602C87318EA5Eff753cDD593bf9bF559` |
+| `production` | `https://production.graphql.api.molecule.xyz/graphql` | Base (`8453`) | `0xECdF4f05384056507485C90aeAb0a83268760D6E` | `0x9F96027eeAFb9ad5F2b5d7043B36Ee96B2EeBE92` | `0x89a14Be8f7824d4775053Edad0f2fA2d6767b72B` |
+
+The contract matrix is synchronized with `desci-infra/lambda/common/utils/chain.ts`.
+`X402_GATEWAY_URL` must be the matching API Gateway base URL (strip
+`/x402/labs/{mutation}` from the stack output), and `MOLECULE_CLIENT_URL` must be the Labs app base URL.
+`config_doctor` reports mismatches as `configurationIssues` and will not report core readiness while any
+remain.
 
 ### Verify offline
 
 `.venv/bin/python smoke.py` lists all tools and exercises the pure-compute ones — no network or
-secrets required. It regression-checks `hex_to_uint256` and `abi_encode` against known-good values,
-confirms `abi_encode` rejects non-`0x` bytes, builds an `ipnft-signer` access condition, and
-round-trips AES-256-GCM encrypt/decrypt.
+secrets required (it neutralizes wallet env so the run stays offline). It confirms the legacy IPNFT tools
+are gone and the OCL primitives + dual-backend wallet tools (`wallet_address`, `eoa_send_transaction`) are
+present, regression-checks `abi_encode` against known-good values, confirms it rejects non-`0x` bytes, builds
+the OCL access conditions (`hasRole` OR `isAuthorizedSignerForTba`, chain `sepolia-base`), round-trips
+AES-256-GCM encrypt/decrypt, and checks wallet-backend resolution (no backend when unset; EOA address
+derivation/selection from `WALLET_PRIVATE_KEY`).
 
 ---
 
 ## Tools
 
-### Privy (wallet management, signing, sending)
+### Wallet (dual-backend: Privy agentic wallet **or** raw EOA)
 
-| Tool | Replaces | Returns |
-|------|----------|---------|
-| `privy_get_wallet_address` | aura `get_wallet_address`; x402 "resolve wallet" curl | `{ address, walletId }` |
-| `privy_list_wallets` | aura Step 0b curl | wallet list |
-| `privy_create_policy` | aura Step 0c curl | `{ policyId }` |
-| `privy_create_wallet` | aura Step 0d curl | `{ walletId, address }` |
-| `privy_sign_message` | aura `sign_message` (terms); service-token sign-in | `{ signature }` |
-| `privy_sign_typed_data` | ad-hoc EIP-712 (x402 does this internally) | `{ signature }` |
-| `privy_send_transaction` | aura `sign_and_send_transaction` (POI anchor, mint, transfer) | `{ txHash }` |
+The user picks the backend (`WALLET_BACKEND=privy|eoa`, auto when one is configured). Backend-agnostic tools
+work either way; the `privy_*` tools are the Privy signer, `eoa_send_transaction` is the local-EOA signer.
+
+| Tool | Backend | Replaces | Returns |
+|------|---------|----------|---------|
+| `wallet_address` | either | backend-agnostic operating-address lookup; reports the active backend | `{ address, backend }` |
+| `privy_get_wallet_address` | privy | aura `get_wallet_address`; x402 "resolve wallet" curl | `{ address, walletId }` |
+| `privy_list_wallets` | privy | aura Step 0b curl | wallet list |
+| `privy_create_policy` | privy | aura Step 0c curl | `{ policyId }` |
+| `privy_create_wallet` | privy | aura Step 0d curl | `{ walletId, address }` |
+| `privy_send_transaction` | privy | LabNFT mint (`mintAndCreateAccount`), `grantRole` | `{ txHash }` |
+| `privy_send_raw_transaction` | privy | sign-only + self-broadcast (LabNFT `safeTransferFrom`) | `{ txHash, nonce, from, gasLimit }` |
+| `eoa_send_transaction` | eoa | local sign + broadcast for ALL EOA writes (mint, `grantRole`, `safeTransferFrom`) | `{ txHash, nonce, from, gasLimit }` |
+| `ocl_read` | n/a (read) | read-only `eth_call` view (mintFeeWei, oclIdOfToken, accountOfToken, ownerOf, hasRole, isAuthorizedSignerForTba) | `{ values, raw }` |
+| `ocl_tx_identity` | n/a (read) | parse a `mintAndCreateAccount` receipt (`OclIdentityCreated`) | `{ tokenId, account, oclId, found }` |
 
 ### Molecule HTTP
 
 | Tool | Replaces | Returns |
 |------|----------|---------|
-| `poi_register` | aura Phase 1 POI curl/http_request | `{ poiTo, poiData, merkleRoot, response }` |
-| `labs_graphql` | aura Steps 2,3,5,6,8 GraphQL; public sign-in queries | `{ data, errors }` |
+| `labs_graphql` | direct GraphQL (`labs(walletAddress)`, `updateLabNftMetadata`, `generateLabImageUploadUrl`, sign-in) | `{ data, errors }` |
 | `x402_pay` | the **entire** P1–P7 flow for one mutation | `{ data, errors, settlement }` |
-| `s3_upload` | aura Step 4/B image+file PUT; x402 E3 ciphertext PUT | `{ status, ok }` |
+| `s3_upload` | cover-image + file PUT; E3 ciphertext PUT | `{ status, ok }` |
 
 `x402_pay` sends the unpaid request, decodes the `payment-required` challenge, signs the EIP-712
-`TransferWithAuthorization` with the Privy wallet (standard camelCase `primaryType`), builds and
-base64-encodes the payment payload, and retries with the `PAYMENT-SIGNATURE` header — all
-internally. The single top-level GraphQL field in `query` **must equal** `mutation`.
+`TransferWithAuthorization` **with the selected wallet backend** (Privy wallet RPC, or local `eth-account`
+for an EOA — pass `backend` when both are configured), builds and base64-encodes the payment payload, and
+retries with the `PAYMENT-SIGNATURE` header — all internally. The single top-level GraphQL field in `query`
+**must equal** `mutation`.
 
 ### DEK-aware (the plaintext DEK never leaves the server)
 
@@ -143,10 +175,9 @@ internally. The single top-level GraphQL field in `query` **must equal** `mutati
 These wrap the DEK mutations and stash the **plaintext DEK in server memory**, returning an opaque
 `dekHandle` instead. The agent passes the handle to `encrypt_file` / `decrypt_file`, so the
 one-shot secret DEK never enters the conversation, a file, or a log. `labs_decrypt_dek` takes
-`ipnftUid`+`filePath` (data-room file, `{contractAddress}_{tokenId}`) or `tokenUri`+`agreementUrl`
-(IPFS agreement) — matching `encryption.graphql`. Both DEK mutations are now x402-whitelisted, but
-the tools default to `transport='direct'` (service-token) so the plaintext DEK stays in-process and
-no payment is needed.
+`oclId`+`filePath` (data-room file) or `tokenUri`+`agreementUrl` (IPFS agreement) — matching
+`encryption.graphql`. Both DEK mutations are x402-whitelisted, but the tools default to
+`transport='direct'` (service-token) so the plaintext DEK stays in-process and no payment is needed.
 
 ### Crypto / encoding (pure compute)
 
@@ -155,16 +186,16 @@ no payment is needed.
 | `encrypt_file` | E1 `node -e` encrypt | `{ iv, contentHash, cipherBytes }` |
 | `decrypt_file` | E6 `node -e` decrypt | `{ plaintextSha256, bytes }` |
 | `sha256_file` | `shasum -a 256` / `wc -c` | `{ sha256, bytes }` |
-| `hex_to_uint256` | aura `hex_to_uint256` | `{ decimal, isSmall }` |
-| `abi_encode` | aura `abi_encode` | `{ calldata }` |
-| `build_access_conditions` | E4 access-condition JSON (`ipnft-signer`) | `{ conditions, json }` |
+| `abi_encode` | calldata for `mintAndCreateAccount` / `grantRole` / `safeTransferFrom` | `{ calldata }` |
+| `build_access_conditions` | E4 OCL access-condition JSON | `{ conditions, json }` |
 
 `encrypt_file`/`decrypt_file` are byte-for-byte compatible with the Labs client
 `encryptFileWithKms`/`decryptFileWithKms`: AES-256-GCM, random 12-byte IV, 16-byte tag
 **appended** to the ciphertext, `contentHash` = hex SHA-256 of the **plaintext**.
 `abi_encode` rejects non-`0x` `bytes`/`bytesN` arguments (a non-`0x` string would otherwise be
-silently misread as UTF-8). `build_access_conditions` builds the V2 `isAuthorizedSignerForIpnft`
-gate keyed on the IP-NFT tokenId.
+silently misread as UTF-8). `build_access_conditions` builds the OCL gate — an OR of
+`hasRole(oclId, :userAddress, CONTRIBUTOR)` and `isAuthorizedSignerForTba(:userAddress, labAccountAddress)`
+on AccessResolver V3, keyed on the lab's `oclId` + token-bound account.
 
 ### Confidentiality latch (fail-closed privacy guard)
 
@@ -177,13 +208,13 @@ not a guarantee, so the server enforces it at the tool boundary, **non-overridab
   file the agent encrypted can never reach S3, regardless of `accessLevel` or which upload path the
   agent takes. Uploading the `.enc` ciphertext, the cover image, or a genuinely-public file is
   unaffected (different bytes / never encrypted).
-- `build_access_conditions` records the IP-NFT **tokenId**. `x402_pay` then **refuses**
-  `finishCreateOrUpdateFileV2` for that tokenId when `accessLevel` is `PUBLIC` or `encryptionMetadata`
-  is missing — a molecule whose access conditions were built can only be finalized non-PUBLIC + encrypted.
+- `build_access_conditions` records the lab's **oclId**. `x402_pay` (and `labs_graphql`) then **refuse**
+  `finishCreateOrUpdateFile` for that oclId when `accessLevel` is `PUBLIC` or `encryptionMetadata`
+  is missing — a file whose access conditions were built can only be finalized non-PUBLIC + encrypted.
 
 The latch is process-local (cleared on subprocess restart, like the DEK store) and keyed on exact
-plaintext bytes + tokenId, so it has no false positives for legitimate public uploads or for a
-different molecule handled in the same session.
+plaintext bytes + oclId, so it has no false positives for legitimate public uploads or for a
+different lab handled in the same session.
 
 ### Bootstrap
 
@@ -191,17 +222,3 @@ different molecule handled in the same session.
 |------|----------|---------|
 | `issue_service_token` | issue an off-chain JWT service token bound to the Privy AGENT wallet (3-step flow) | `{ token, tokenId, expiresAt }` |
 | `issue_owner_service_token` | issue an off-chain JWT service token bound to the OWNER EOA (signs with `WALLET_PRIVATE_KEY`) | `{ token, tokenId, address, expiresAt }` |
-
----
-
-## Source-of-truth parity
-
-| Behavior | Replicated from |
-|----------|-----------------|
-| x402 challenge / payment header / `PAYMENT-SIGNATURE` | `desci-infra/lambda/x402-gateway-lambda/index.ts` |
-| x402 mutation whitelist | `desci-infra/lambda/x402-gateway-lambda/mutations.ts` |
-| AES-256-GCM envelope (12-byte IV, appended tag, plaintext hash) | `desci-ecosystem/packages/storage/src/lib/encryption/kms-envelope.ts` |
-| `accessControlConditions` (`isAuthorizedSignerForIpnft`) | `desci-infra/lambda/common/utils/access-control-conditions.ts` + `desci-infra/bruno/desci-labs/v2/25-finishEncryptedFileUploadV2.bru` |
-| EIP-712 typed-data `primaryType` | `skills/privy-agentic-wallets/references/transactions.md` |
-| GraphQL field shapes / `EncryptionMetadataInput` / `decryptDataKey` args | `desci-infra/graphql/schemas/{ip-hubs,encryption}.graphql` |
-| Request shapes & auth headers | `desci-infra/bruno/desci-labs/v2` + `desci-infra/bruno/service-auth` |

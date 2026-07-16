@@ -1,7 +1,7 @@
 [project]
 name = "molecule-mcp"
-version = "1.1.0"
-description = "stdio MCP server backing the aura-orchestrator skill (public or private/encrypted data-room uploads) — wraps Privy, POI, Labs GraphQL, the x402 payment flow, S3 uploads, AES-256-GCM envelope crypto, ABI encoding and on-chain access conditions (V2 surface, ipnftUid)."
+version = "1.3.0"
+description = "stdio MCP server backing the aura-orchestrator skill (On-Chain Lab creation + public or private/encrypted data-room uploads) — wraps Privy, on-chain OCL reads, Labs GraphQL, the x402 payment flow, S3 uploads, AES-256-GCM envelope crypto, ABI encoding and on-chain access conditions (OCL/V3 surface, oclId)."
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",
@@ -10,6 +10,7 @@ dependencies = [
     "eth-abi>=5",
     "eth-utils>=4",
     "eth-hash[pycryptodome]>=0.5",
+    "eth-account>=0.13.7",
 ]
 
 [project.scripts]

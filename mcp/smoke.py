@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline smoke test: connect to the stdio server, list tools, and exercise the
-pure-compute tools. No network or secrets required. Regression-checks the compute
-outputs against the known-good values from the original TypeScript implementation.
+pure-compute tools (OCL surface). No network or secrets required. Regression-checks
+the compute outputs against known-good values.
 
 Run:  .venv/bin/python smoke.py
 """
@@ -16,15 +16,15 @@ from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
 
-EXPECT = {
-    "hex_to_uint256(0x35554760)": ("decimal", "894781280"),
-    "abi safeTransferFrom": (
-        "calldata",
-        "0x42842e0e000000000000000000000000acb7bfa4d926e8df448cd08918a0d38bd6b40b54"
-        "000000000000000000000000a2ec2967da7bc51494f8a5427b9784cb5a05cd3c"
-        "0000000000000000000000000000000000000000000000000000000000000118",
-    ),
-}
+# Known-good calldata from the TypeScript implementation (chain-agnostic).
+EXPECT_SAFE_TRANSFER = (
+    "0x42842e0e000000000000000000000000acb7bfa4d926e8df448cd08918a0d38bd6b40b54"
+    "000000000000000000000000a2ec2967da7bc51494f8a5427b9784cb5a05cd3c"
+    "0000000000000000000000000000000000000000000000000000000000000118"
+)
+
+OCL_ID = "0x" + "11" * 32
+LAB_ACCOUNT = "0x3333333333333333333333333333333333333333"
 
 
 async def main() -> None:
@@ -33,10 +33,24 @@ async def main() -> None:
         args=[str(HERE / "server.py")],
         env={
             **os.environ,
+            # Neutralize wallet/secret env so this stays genuinely offline (no Privy
+            # network call) even on a dev box whose project-base .claude carries secrets.
+            # Empty-string keys are "present" so the server's bootstrap won't reload the
+            # real values, yet env() treats them as unset — leaving NO signing backend
+            # configured, which is exactly the watch-only path we assert below.
+            "PRIVY_APP_ID": "",
+            "PRIVY_APP_SECRET": "",
+            "PRIVY_WALLET_ID": "",
+            "WALLET_PRIVATE_KEY": "",
+            "WALLET_BACKEND": "",
+            "MOLECULE_SERVICE_TOKEN": "",
+            "ENVIRONMENT": "staging",
+            "MOLECULE_LABS_URL": "https://staging.graphql.api.molecule.xyz/graphql",
             "EVM_WALLET_ADDRESS": "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c",
             "ACCESS_RESOLVER_ADDRESS": "0x5493F472602C87318EA5Eff753cDD593bf9bF559",
-            "CHAIN_ID": "84532",
-            "ENVIRONMENT": "migration",
+            "ONCHAIN_LAB_FACTORY_ADDRESS": "0xd629FE2310b4309a212495F10A47f8436dcEfD90",
+            "LABNFT_ADDRESS": "0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28",
+            "CHAIN_ID": "84532",  # Base Sepolia (OCL canonical chain)
         },
     )
     async with stdio_client(params) as (read, write):
@@ -44,6 +58,7 @@ async def main() -> None:
             await session.initialize()
             tools = (await session.list_tools()).tools
             print("TOOL COUNT:", len(tools))
+            tool_names = {t.name for t in tools}
             for t in sorted(tools, key=lambda x: x.name):
                 print(" -", t.name)
 
@@ -53,54 +68,96 @@ async def main() -> None:
 
             ok = True
 
-            r = await call("hex_to_uint256", {"hex": "0x35554760"})
-            ok &= r["decimal"] == EXPECT["hex_to_uint256(0x35554760)"][1]
-            print("hex_to_uint256:", r)
+            # Legacy IPNFT tools must be GONE.
+            for gone in ("poi_register", "hex_to_uint256"):
+                present = gone in tool_names
+                ok &= not present
+                print(f"removed {gone}:", not present)
+            # New OCL primitives + dual-backend wallet tools must be present.
+            for needed in (
+                "ocl_read",
+                "ocl_tx_identity",
+                "build_access_conditions",
+                "wallet_address",
+                "eoa_send_transaction",
+            ):
+                present = needed in tool_names
+                ok &= present
+                print(f"has {needed}:", present)
 
-            print("hex small:", await call("hex_to_uint256", {"hex": "0x01"}))
+            # The staging fixture must match the supported backend profile and
+            # must not produce cross-environment configuration warnings.
+            doctor = await call("config_doctor", {})
+            doctor_ok = (
+                doctor["expectedEnvironmentProfile"]["CHAIN_ID"] == "84532"
+                and doctor["configurationIssues"] == []
+            )
+            ok &= doctor_ok
+            print("config_doctor staging profile consistent:", doctor_ok)
 
+            # abi_encode: known-good safeTransferFrom (regression).
             r = await call("abi_encode", {
                 "functionSignature": "safeTransferFrom(address,address,uint256)",
                 "args": ["0xacb7bfa4d926e8df448cd08918a0d38bd6b40b54", "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", "280"],
             })
-            ok &= r["calldata"] == EXPECT["abi safeTransferFrom"][1]
-            print("abi safeTransferFrom matches TS:", r["calldata"] == EXPECT["abi safeTransferFrom"][1])
+            ok &= r["calldata"] == EXPECT_SAFE_TRANSFER
+            print("abi safeTransferFrom matches TS:", r["calldata"] == EXPECT_SAFE_TRANSFER)
 
+            # OCL calldata: mintAndCreateAccount(address) = 4-byte selector + 32-byte address.
             r = await call("abi_encode", {
-                "functionSignature": "mintReservation(address,uint256,string,string,bytes)",
-                "args": ["0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", "123456789012345678901234567890", "ipfs://Qm", "SYMB", "0xdeadbeef"],
+                "functionSignature": "mintAndCreateAccount(address)",
+                "args": ["0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c"],
             })
-            print("abi mintReservation calldata:", r["calldata"][:18], "...")
+            ok &= r["calldata"].startswith("0x") and len(r["calldata"]) == 2 + 8 + 64
+            print("abi mintAndCreateAccount:", r["calldata"])
 
-            # bytes without 0x must be REJECTED (not silently UTF-8 encoded)
+            # grantRole(bytes32,address,uint8,uint64,bool) = selector + 5×32 bytes.
+            r = await call("abi_encode", {
+                "functionSignature": "grantRole(bytes32,address,uint8,uint64,bool)",
+                "args": [OCL_ID, "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", 2, 0, False],
+            })
+            ok &= r["calldata"].startswith("0x") and len(r["calldata"]) == 2 + 8 + 64 * 5
+            print("abi grantRole len ok:", len(r["calldata"]) == 2 + 8 + 64 * 5)
+
+            # bytes32 without 0x must be REJECTED (not silently UTF-8 encoded).
             bad = await session.call_tool("abi_encode", {
-                "functionSignature": "mintReservation(address,uint256,string,string,bytes)",
-                "args": ["0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", "1", "x", "y", "deadbeef"],
+                "functionSignature": "grantRole(bytes32,address,uint8,uint64,bool)",
+                "args": ["deadbeef", "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c", 2, 0, False],
             })
             rejected = bad.isError or ("must be 0x-prefixed hex" in bad.content[0].text)
             ok &= rejected
-            print("abi rejects non-0x bytes:", rejected)
+            print("abi rejects non-0x bytes32:", rejected)
 
-            r = await call("build_access_conditions", {"mode": "ipnft-signer", "reservationId": "123456789"})
-            ok &= r["conditions"][0]["functionName"] == "isAuthorizedSignerForIpnft" and r["conditions"][0]["chain"] == "baseSepolia"
-            print("ipnft-signer ok:", r["conditions"][0]["functionName"], r["conditions"][0]["chain"])
+            # OCL access conditions: hasRole OR isAuthorizedSignerForTba, chain sepolia-base.
+            r = await call("build_access_conditions", {"oclId": OCL_ID, "labAccountAddress": LAB_ACCOUNT})
+            conds = r["conditions"]
+            shape_ok = (
+                len(conds) == 3
+                and conds[0]["functionName"] == "hasRole"
+                and conds[0]["functionParams"] == [OCL_ID, ":userAddress", "2"]
+                and conds[0]["chain"] == "sepolia-base"
+                and conds[1] == {"operator": "or"}
+                and conds[2]["functionName"] == "isAuthorizedSignerForTba"
+                and conds[2]["functionParams"] == [":userAddress", LAB_ACCOUNT]
+            )
+            ok &= shape_ok
+            print("OCL access conditions shape ok:", shape_ok)
+
+            # viewer role variant -> role "1".
+            r = await call("build_access_conditions", {"oclId": OCL_ID, "labAccountAddress": LAB_ACCOUNT, "role": "viewer"})
+            ok &= r["conditions"][0]["functionParams"][2] == "1"
+            print("viewer role -> 1:", r["conditions"][0]["functionParams"][2])
 
             r = await call("privy_get_wallet_address", {})  # env path, no network
             ok &= r["address"] == "0xa2eC2967Da7bC51494F8a5427B9784Cb5a05cD3c"
             print("privy_get_wallet_address (env, no net):", r)
 
-            # round-trip encrypt/decrypt via dekHandle (no network: inject a fake DEK)
+            # round-trip encrypt/decrypt (no network: inject a fake DEK, call pure impls)
             import base64 as b64
-            dek = b64.b64encode(b"0" * 32).decode()
-            tmp = HERE / "_smoke_plain.bin"
-            enc = HERE / "_smoke.enc"
-            dec = HERE / "_smoke.dec"
-            tmp.write_bytes(b"hello molecule e2ee")
-            # We can't call labs_generate_dek (network); test the crypto impl directly:
             import server as srv
-            h = srv.put_dek(dek)
-            e = json.loads((await session.call_tool("encrypt_file", {"filePath": str(tmp), "dekHandle": h, "outPath": str(enc)})).content[0].text) if False else None
-            # encrypt/decrypt impls are pure; call them directly for the round-trip check
+            dek = b64.b64encode(b"0" * 32).decode()
+            tmp, enc, dec = HERE / "_smoke_plain.bin", HERE / "_smoke.enc", HERE / "_smoke.dec"
+            tmp.write_bytes(b"hello molecule e2ee")
             e = srv.encrypt_file_impl(str(tmp), dek, str(enc))
             d = srv.decrypt_file_impl(str(enc), e["iv"], dek, str(dec))
             roundtrip = d["plaintextSha256"] == e["contentHash"] and dec.read_bytes() == b"hello molecule e2ee"
@@ -109,7 +166,71 @@ async def main() -> None:
             for p in (tmp, enc, dec):
                 p.unlink(missing_ok=True)
 
-            print("\nALL ASSERTIONS PASS:" , ok)
+            # Wallet-backend resolution + EOA address derivation (pure compute, offline).
+            # Hardhat account #0 — a well-known throwaway key, never funded for real use.
+            TEST_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            TEST_ADDR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            _wallet_keys = (
+                "WALLET_PRIVATE_KEY", "WALLET_BACKEND",
+                "PRIVY_APP_ID", "PRIVY_APP_SECRET", "PRIVY_WALLET_ID",
+            )
+            _saved = {k: os.environ.get(k) for k in _wallet_keys}
+            try:
+                for k in _wallet_keys:
+                    os.environ.pop(k, None)
+                no_backend = srv.available_backends() == []
+                os.environ["WALLET_PRIVATE_KEY"] = TEST_PK
+                eoa_backend = (
+                    srv.available_backends() == ["eoa"]
+                    and srv.resolve_backend() == "eoa"
+                    and srv._eoa_address() == TEST_ADDR
+                )
+            finally:
+                for k in _wallet_keys:
+                    os.environ.pop(k, None)
+                    if _saved[k] is not None:
+                        os.environ[k] = _saved[k]
+            ok &= no_backend and eoa_backend
+            print("wallet backend: none-when-unset:", no_backend, "| eoa derive/select:", eoa_backend)
+
+            # ABI/RPC address decoders return lowercase strings. eth-account requires
+            # a checksummed string recipient when it builds/signs the transaction.
+            lower_lab_nft = "0x13ff210695fdb54a7f928eccc28bc3486c05bb28"
+            checksummed = srv._checksum_tx_recipient(lower_lab_nft)
+            from eth_account import Account
+            signed = Account.from_key(TEST_PK).sign_transaction({
+                "to": checksummed,
+                "value": 0,
+                "gas": 21_000,
+                "maxFeePerGas": 5_000_000_000,
+                "maxPriorityFeePerGas": 2_000_000_000,
+                "nonce": 0,
+                "chainId": 84_532,
+                "type": 2,
+            })
+            checksum_ok = (
+                checksummed == "0x13Ff210695fdb54A7F928ECcc28BC3486c05BB28"
+                and bool(signed.raw_transaction)
+            )
+            ok &= checksum_ok
+            print("EOA recipient checksum normalization:", checksum_ok)
+
+            # Keep both supported deployment profiles pinned to the backend's
+            # chain.ts values; no third/pre-production profile is supported.
+            profiles = srv._OCL_CONFIG_BY_ENVIRONMENT
+            profile_ok = (
+                set(profiles) == {"staging", "production"}
+                and profiles["staging"]["CHAIN_ID"] == "84532"
+                and profiles["staging"]["ONCHAIN_LAB_FACTORY_ADDRESS"]
+                == "0xd629FE2310b4309a212495F10A47f8436dcEfD90"
+                and profiles["production"]["CHAIN_ID"] == "8453"
+                and profiles["production"]["ONCHAIN_LAB_FACTORY_ADDRESS"]
+                == "0xECdF4f05384056507485C90aeAb0a83268760D6E"
+            )
+            ok &= profile_ok
+            print("staging/production OCL profiles current:", profile_ok)
+
+            print("\nALL ASSERTIONS PASS:", ok)
             if not ok:
                 raise SystemExit(1)
 
