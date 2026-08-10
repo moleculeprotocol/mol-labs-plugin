@@ -4,7 +4,7 @@ version = "1.3.0"
 description = "stdio MCP server backing the aura-orchestrator skill (On-Chain Lab creation + public or private/encrypted data-room uploads) — wraps Privy, on-chain OCL reads, Labs GraphQL, the x402 payment flow, S3 uploads, AES-256-GCM envelope crypto, ABI encoding and on-chain access conditions (OCL/V3 surface, oclId)."
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2",
     "httpx>=0.27",
     "cryptography>=42",
     "eth-abi>=5",
