@@ -18,6 +18,7 @@ metadata:
     - PRIVY_APP_SECRET
     - PRIVY_WALLET_ID
     - WALLET_PRIVATE_KEY
+    - MOLECULE_CONSUMER_CREDENTIAL
     - MOLECULE_API_KEY
     - MOLECULE_SERVICE_TOKEN
 ---
@@ -72,7 +73,8 @@ Set `WALLET_BACKEND=privy|eoa` to pin the choice (auto-selected when only one is
 | `EVM_WALLET_ADDRESS` | EOA address for **watch-only reads** and the **Phase-5 owner / hand-off target** (optional — skip Phase 5 if not set or equal to the operating wallet). Under the **privy** backend this is NOT the operating signer. |
 | `PRIVY_APP_ID` / `PRIVY_APP_SECRET` / `PRIVY_WALLET_ID` | **Privy backend (optional).** Privy agentic wallet — `mcp__molecule__privy_*` tools + x402 + `issue_service_token`. |
 | `WALLET_PRIVATE_KEY` | **EOA backend (optional, secret).** Raw EOA private key — the MCP's **local** signer for `eoa_send_transaction`, x402 payments, and `issue_owner_service_token`. The key never leaves the MCP process. Needed only when `WALLET_BACKEND=eoa` (or the EOA is the only configured wallet). |
-| `MOLECULE_API_KEY` | `x-api-key` for direct `labs_graphql` reads (e.g. the `labs(walletAddress)` resolve query). |
+| `MOLECULE_CONSUMER_CREDENTIAL` | **Preferred Labs consumer auth (secret).** `mol_<consumerId>_<secret>` credential, sent verbatim as `Authorization` (no `Bearer`) on every Labs call — direct `labs_graphql` reads (e.g. the `labs(walletAddress)` resolve query), sign-in queries, DEK calls. |
+| `MOLECULE_API_KEY` | **Legacy fallback (secret).** The shared `x-api-key` for the same calls, until the `mol_` credential migration completes. If both are set, the MCP sends both headers. |
 | `MOLECULE_SERVICE_TOKEN` | **Private uploads only.** Off-chain JWT for the direct (non-x402) DEK generate/decrypt calls, bound to one wallet's `adminAddress`. If missing/expired, issue one bound to the operating wallet — Privy via `issue_service_token`, EOA via `issue_owner_service_token` (see **Service Token**). Secret — keep in `settings.local.json`. |
 
 **Note:** The MCP server reads all URLs, contract addresses, API keys, and secrets from the environment

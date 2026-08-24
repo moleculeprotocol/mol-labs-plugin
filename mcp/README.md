@@ -19,8 +19,10 @@ configured, required when both are). `config_doctor` reports the active backend 
 - **Deps:** `mcp`, `httpx`, `cryptography`, `eth-abi`, `eth-utils`, `eth-hash[pycryptodome]`
 
 Nothing is ever written to **stdout** except the JSON-RPC protocol (FastMCP owns stdout); all
-diagnostics go to **stderr**. Secrets (`PRIVY_APP_SECRET`, the plaintext DEK, the service token,
-API keys) are never logged or returned to the caller.
+diagnostics go to **stderr**. Secrets (`PRIVY_APP_SECRET`, the plaintext DEK, consumer credentials /
+API keys, the service token) are never logged. None are returned to the caller either, with one
+deliberate exception: the `issue_service_token` / `issue_owner_service_token` tools return the JWT they
+mint, so you can store it as `MOLECULE_SERVICE_TOKEN` in your harness's secret config.
 
 ---
 
@@ -98,7 +100,8 @@ arguments** — only file paths, queries, addresses, and the ephemeral `dekHandl
 | `PRIVY_APP_SECRET` | settings.local.json | **[privy backend, optional]** Privy tools (basic-auth pass) |
 | `PRIVY_WALLET_ID` | settings.local.json | **[privy backend, optional]** Privy wallet that signs/sends |
 | `WALLET_PRIVATE_KEY` | settings.local.json | **[eoa backend, optional]** raw EOA key — local signer for `eoa_send_transaction`, x402, `issue_owner_service_token` |
-| `MOLECULE_API_KEY` | settings.local.json | `labs_graphql` (auth=`api-key`) |
+| `MOLECULE_CONSUMER_CREDENTIAL` | settings.local.json | **Preferred Labs consumer auth** — `mol_<consumerId>_<secret>`, sent verbatim as `Authorization` (no `Bearer`) on every Labs call |
+| `MOLECULE_API_KEY` | settings.local.json | Legacy shared `x-api-key` — fallback while the `mol_` migration completes; if both are set, both headers are sent |
 | `MOLECULE_SERVICE_TOKEN` | settings.local.json | `labs_graphql`/DEK tools (auth=`service-token`) |
 
 The wallet vars are **optional until you pick a backend** — configure the Privy trio **or**
