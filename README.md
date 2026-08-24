@@ -53,7 +53,15 @@ The MCP server runs via **`uv run mcp/server.py`**, which reads the PEP 723 inli
 The server reads all config/secrets from the environment (never from tool args). Provide them however
 your harness injects env into MCP subprocesses. Non-secrets: `ENVIRONMENT`, `MOLECULE_CLIENT_URL`, `MOLECULE_LABS_URL`,
 `X402_GATEWAY_URL`, `ACCESS_RESOLVER_ADDRESS`, `ONCHAIN_LAB_FACTORY_ADDRESS`, `LABNFT_ADDRESS`, `CHAIN_ID`,
-`EVM_WALLET_ADDRESS`, `EVM_RPC_URL`, `WALLET_BACKEND`. Secrets: `MOLECULE_API_KEY`, `MOLECULE_SERVICE_TOKEN`.
+`EVM_WALLET_ADDRESS`, `EVM_RPC_URL`, `WALLET_BACKEND`. Secrets: `MOLECULE_CONSUMER_CREDENTIAL` (or the
+legacy `MOLECULE_API_KEY`), `MOLECULE_SERVICE_TOKEN`.
+
+**Labs consumer auth — `mol_` credentials preferred.** The Labs API is migrating from one shared
+`x-api-key` to per-consumer credentials: a single `mol_<consumerId>_<secret>` string sent verbatim as the
+`Authorization` header (no `Bearer` prefix — that is reserved for Privy user tokens). Set it as
+`MOLECULE_CONSUMER_CREDENTIAL`; the legacy shared key still works via `MOLECULE_API_KEY` until the
+migration completes. If both are set the MCP sends both headers, so one config works against either
+authorizer mode.
 
 **Wallet secrets are optional — pick ONE backend** (all wallet env is optional until you choose, and
 `config_doctor` reports which backend is active and what it still needs):
@@ -111,7 +119,8 @@ PRIVY_APP_SECRET = "…"
 PRIVY_WALLET_ID = "…"
 #   …or a raw EOA (instead of the three Privy vars):
 # WALLET_PRIVATE_KEY = "0x…"
-MOLECULE_API_KEY = "…"
+MOLECULE_CONSUMER_CREDENTIAL = "…"  # mol_<consumerId>_<secret> — preferred Labs consumer auth
+# MOLECULE_API_KEY = "…"            # …or the legacy shared x-api-key (fallback during migration)
 MOLECULE_SERVICE_TOKEN = "…"
 ```
 or, equivalently: `codex mcp add molecule --env CHAIN_ID=84532 --env … -- uv run /abs/path/to/molecule-plugin/mcp/server.py`

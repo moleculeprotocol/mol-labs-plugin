@@ -581,13 +581,25 @@ def _labs_headers(
     wallet_address: str | None = None,
 ) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    # The Labs endpoint is AppSync in API_KEY auth mode: the x-api-key transport
-    # gate applies to EVERY request, regardless of the logical auth layer above it
-    # — service-token identity calls AND the unauthenticated 'none' sign-in queries
-    # that issue_service_token uses (getServiceSignInMessage / generateServiceToken).
-    # Without x-api-key the gateway 401s before the resolver runs. So attach it
-    # whenever it is configured; the identity headers below layer on top.
+    # Consumer gate — applies to EVERY request, regardless of the logical auth
+    # layer above it: service-token identity calls AND the unauthenticated 'none'
+    # sign-in queries that issue_service_token uses. Without it the gateway 401s
+    # before the resolver runs. The API is migrating from one shared AppSync
+    # x-api-key to per-consumer mol_ credentials (a single mol_<consumerId>_<secret>
+    # string sent verbatim as Authorization — no Bearer prefix; Bearer is reserved
+    # for Privy user tokens). Attach whichever is configured; with both set, both
+    # ride along so one config works against either authorizer mode during the
+    # migration. The identity headers below layer on top either way.
+    consumer_cred = env("MOLECULE_CONSUMER_CREDENTIAL")
+    if consumer_cred and not consumer_cred.startswith("mol_"):
+        raise ToolError(
+            "MOLECULE_CONSUMER_CREDENTIAL must be a mol_<consumerId>_<secret> "
+            "credential (sent verbatim as the Authorization header). For the "
+            "legacy shared key use MOLECULE_API_KEY instead."
+        )
     api_key = env("MOLECULE_API_KEY")
+    if consumer_cred:
+        headers["Authorization"] = consumer_cred
     if api_key:
         headers["x-api-key"] = api_key
     if auth == "service-token":
@@ -608,8 +620,11 @@ def _labs_headers(
             )
         headers["x-service-token"] = token
         headers["x-wallet-address"] = addr
-    elif auth == "api-key" and not api_key:
-        require_env("MOLECULE_API_KEY")  # raise the standard missing-env error
+    elif auth == "api-key" and not (consumer_cred or api_key):
+        raise ToolError(
+            "Labs consumer auth is not configured: set MOLECULE_CONSUMER_CREDENTIAL "
+            "(mol_<consumerId>_<secret>, preferred) or the legacy shared MOLECULE_API_KEY."
+        )
     return headers
 
 
@@ -1392,7 +1407,9 @@ def labs_graphql(
     labsUrl: str | None = None,
 ) -> str:
     """POST a GraphQL query/mutation to $MOLECULE_LABS_URL. auth='api-key' sends
-    x-api-key:$MOLECULE_API_KEY (aura mint flow). auth='service-token' sends
+    the consumer credential (Authorization:$MOLECULE_CONSUMER_CREDENTIAL, a
+    mol_<consumerId>_<secret> string; falls back to the legacy
+    x-api-key:$MOLECULE_API_KEY) — aura mint flow. auth='service-token' sends
     x-service-token:$MOLECULE_SERVICE_TOKEN + x-wallet-address:$EVM_WALLET_ADDRESS
     (private/encrypted upload). auth='none' for public sign-in queries. Returns {data, errors}.
     Do NOT use for generateDataEncryptionKey/decryptDataKey — use
@@ -1865,18 +1882,20 @@ _ENV_CATALOG: list[tuple[str, bool, str]] = [
     ("PRIVY_APP_ID", True, "[privy backend] Privy app id — agentic wallet ops + x402 (optional)"),
     ("PRIVY_APP_SECRET", True, "[privy backend] Privy app secret — agentic wallet ops + x402 (optional)"),
     ("PRIVY_WALLET_ID", True, "[privy backend] Privy agentic wallet id (optional)"),
-    ("MOLECULE_API_KEY", True, "x-api-key for direct Labs reads"),
+    ("MOLECULE_CONSUMER_CREDENTIAL", True, "mol_<consumerId>_<secret> consumer credential for Labs calls — sent as Authorization (preferred)"),
+    ("MOLECULE_API_KEY", True, "Legacy shared x-api-key for Labs calls (fallback until the mol_ migration completes)"),
     ("MOLECULE_SERVICE_TOKEN", True, "Service JWT for private/encrypted DEK calls"),
     ("WALLET_PRIVATE_KEY", True, "[eoa backend] Raw EOA private key — local signer for x402 / mint / grant / transfer / service token (optional)"),
 ]
 
 # Per-flow required NON-wallet vars, for a quick readiness verdict. Wallet readiness is
 # reported separately (walletBackends) because either backend satisfies the spending flows.
+# A "A|B" entry means any one of the alternatives satisfies the requirement.
 _FLOW_REQUIREMENTS: list[tuple[str, list[str]]] = [
-    ("labs_reads", ["ENVIRONMENT", "MOLECULE_LABS_URL", "MOLECULE_API_KEY"]),
+    ("labs_reads", ["ENVIRONMENT", "MOLECULE_LABS_URL", "MOLECULE_CONSUMER_CREDENTIAL|MOLECULE_API_KEY"]),
     ("onchain_lab", ["ENVIRONMENT", "ONCHAIN_LAB_FACTORY_ADDRESS", "ACCESS_RESOLVER_ADDRESS", "CHAIN_ID"]),
     ("x402_mutations", ["ENVIRONMENT", "X402_GATEWAY_URL", "CHAIN_ID"]),  # + any one wallet backend
-    ("private_encrypted_upload", ["MOLECULE_SERVICE_TOKEN", "MOLECULE_API_KEY"]),
+    ("private_encrypted_upload", ["MOLECULE_SERVICE_TOKEN", "MOLECULE_CONSUMER_CREDENTIAL|MOLECULE_API_KEY"]),
 ]
 
 
@@ -1939,10 +1958,20 @@ def config_doctor(showValues: bool = True) -> str:
             "MOLECULE_CLIENT_URL must be the Labs app base URL only; the workflow appends "
             "/projects/{shortname}."
         )
+    consumer_cred = env("MOLECULE_CONSUMER_CREDENTIAL")
+    if consumer_cred and not consumer_cred.startswith("mol_"):
+        configuration_issues.append(
+            "MOLECULE_CONSUMER_CREDENTIAL does not look like a mol_<consumerId>_<secret> "
+            "credential (sent verbatim as Authorization); the legacy shared key belongs "
+            "in MOLECULE_API_KEY."
+        )
 
     flows: list[dict[str, Any]] = []
     for flow, required in _FLOW_REQUIREMENTS:
-        missing = [r for r in required if not os.environ.get(r)]
+        missing = [
+            r for r in required
+            if not any(os.environ.get(alt) for alt in r.split("|"))
+        ]
         flows.append({"flow": flow, "ready": not missing, "missing": missing})
 
     # Wallet readiness is per-backend — the user picks ONE (or sets WALLET_BACKEND to
