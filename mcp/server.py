@@ -590,6 +590,12 @@ def _labs_headers(
     api_key = env("MOLECULE_API_KEY")
     if api_key:
         headers["x-api-key"] = api_key
+        # Production AppSync routes requests that carry identity headers (e.g.
+        # x-service-token) through an authorizer that reads Authorization; without
+        # it the transport 401s (UnauthorizedException) before any resolver runs.
+        # Staging accepts x-api-key alone and tolerates the extra header, so we
+        # always send both. (Found 2026-08-21 finishing the first production lab.)
+        headers["Authorization"] = api_key
     if auth == "service-token":
         # Per-call overrides let the agent act as any authorized wallet (e.g.
         # decrypt as the OWNER wallet) without swapping env / reloading. The
@@ -1468,8 +1474,10 @@ def labs_generate_dek(
     (default, service-token) is the recommended path — it needs no payment and keeps
     the DEK in-process. generateDataEncryptionKey IS now x402-whitelisted (mutations.ts),
     so transport='x402' also works, but prefer 'direct' for DEK generation."""
+    # The 2026-08 schema dropped `isSuccess` from result types (selecting it is
+    # now a hard validation error); success = the payload field being present.
     query = (
-        "mutation GenerateDataEncryptionKey { generateDataEncryptionKey { isSuccess "
+        "mutation GenerateDataEncryptionKey { generateDataEncryptionKey { "
         "plaintextDEK encryptedDek encryptionSystem error { message code retryable } } }"
     )
     if transport == "x402":
@@ -1482,7 +1490,7 @@ def labs_generate_dek(
         if r.get("errors"):
             raise ToolError(f"generateDataEncryptionKey errors: {json.dumps(r['errors'])[:400]}")
         result = (r.get("data") or {}).get("generateDataEncryptionKey")
-    if not result or not result.get("isSuccess") or not result.get("plaintextDEK"):
+    if not result or result.get("error") or not result.get("plaintextDEK"):
         raise ToolError(
             f"generateDataEncryptionKey did not succeed: {json.dumps((result or {}).get('error') or result)[:400]}"
         )
@@ -1546,7 +1554,7 @@ def labs_decrypt_dek(
         variables["agreementUrl"] = agreementUrl
     query = (
         f"mutation DecryptDataKey({', '.join(arg_decls)}) {{ decryptDataKey({', '.join(arg_uses)}) "
-        "{ isSuccess plaintextDEK iv message error { message code retryable } } }"
+        "{ plaintextDEK iv message error { message code retryable } } }"
     )
     if transport == "x402":
         r = run_x402_pay("decryptDataKey", query, variables, gatewayUrl, walletId, backend)
@@ -1557,8 +1565,9 @@ def labs_decrypt_dek(
             service_token=serviceToken, wallet_address=walletAddress,
         )
         result = (r.get("data") or {}).get("decryptDataKey")
-    if not result or not result.get("isSuccess") or not result.get("plaintextDEK"):
+    if not result or not result.get("plaintextDEK"):
         # Surface backend status verbatim (ACCESS_DENIED / LEGACY_ENCRYPTION).
+        # `isSuccess` here is this tool's OWN output contract, not a schema field.
         return dump(
             {
                 "isSuccess": False,
@@ -1785,13 +1794,13 @@ def issue_service_token(
     tok = labs_graphql_call(
         "mutation GenerateServiceToken($serviceName: String!, $expiresIn: String!, $walletAddress: String, $messageSignature: String) "
         "{ generateServiceToken(serviceName: $serviceName, expiresIn: $expiresIn, walletAddress: $walletAddress, messageSignature: $messageSignature) "
-        "{ token tokenId serviceName expiresAt isSuccess message } }",
+        "{ token tokenId serviceName expiresAt message } }",
         {"serviceName": serviceName, "expiresIn": expiresIn, "walletAddress": addr, "messageSignature": message_signature},
         "none",
         labsUrl,
     )
     result = (tok.get("data") or {}).get("generateServiceToken")
-    if not result or not result.get("isSuccess") or not result.get("token"):
+    if not result or not result.get("token"):
         raise ToolError(f"generateServiceToken failed: {json.dumps(result or tok.get('errors'))[:300]}")
     return dump({"token": result.get("token"), "tokenId": result.get("tokenId"), "expiresAt": result.get("expiresAt")})
 
@@ -1830,12 +1839,12 @@ def issue_owner_service_token(
     signature = signature if signature.startswith("0x") else "0x" + signature
     tok_q = ("mutation GenerateServiceToken($s: String!, $e: String, $w: String, $m: String) { "
              "generateServiceToken(serviceName: $s, expiresIn: $e, walletAddress: $w, messageSignature: $m) "
-             "{ token tokenId expiresAt isSuccess message } }")
+             "{ token tokenId expiresAt message } }")
     t = labs_graphql_call(
         tok_q, {"s": serviceName, "e": expiresIn, "w": acct.address, "m": signature}, "api-key", labsUrl
     )
     res = ((t.get("data") or {}).get("generateServiceToken")) or {}
-    if not res.get("isSuccess") or not res.get("token"):
+    if not res.get("token"):
         raise ToolError(f"generateServiceToken failed: {json.dumps(res or t.get('errors'))[:400]}")
     return dump({
         "token": res.get("token"),
